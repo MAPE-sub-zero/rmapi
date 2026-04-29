@@ -44,12 +44,14 @@ type Version int
 const (
 	V3 Version = iota
 	V5
+	V6
 )
 
 // Header starting a .rm binary file. This can help recognizing a .rm file.
 const (
 	HeaderV3  = "reMarkable .lines file, version=3          "
 	HeaderV5  = "reMarkable .lines file, version=5          "
+	HeaderV6  = "reMarkable .lines file, version=6          "
 	HeaderLen = 43
 )
 
@@ -62,11 +64,13 @@ const (
 // BrushColor defines the 3 colors of the brush.
 type BrushColor uint32
 
-// Mapping of the three colors.
+// Mapping of the colors.
 const (
 	Black BrushColor = 0
 	Grey  BrushColor = 1
 	White BrushColor = 2
+	Blue  BrushColor = 6
+	Red   BrushColor = 7
 )
 
 // BrushType respresents the type of brush.
@@ -95,6 +99,7 @@ const (
 	TiltPencilV5  BrushType = 14
 	BrushV5       BrushType = 12
 	HighlighterV5 BrushType = 18
+	Calligraphy   BrushType = 9
 )
 
 // BrushSize represents the base brush sizes.
@@ -107,11 +112,24 @@ const (
 	Large  BrushSize = 2.125
 )
 
+// A HighlightRect defines a rectangular region for a highlight annotation.
+type HighlightRect struct {
+	X, Y, W, H float64
+}
+
+// A Highlight represents a text highlight annotation (v6).
+type Highlight struct {
+	Color BrushColor
+	Text  string
+	Rects []HighlightRect
+}
+
 // A Rm represents an entire .rm file
 // and is composed of layers.
 type Rm struct {
-	Version Version
-	Layers  []Layer
+	Version    Version
+	Layers     []Layer
+	Highlights []Highlight
 }
 
 // A Layer contains lines.

@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -34,7 +35,7 @@ func (z *Zip) Read(r io.ReaderAt, size int64) error {
 	}
 
 	//uploading and then downloading a file results in 0 pages
-	if z.Content.PageCount <= 0 {
+	if z.Content.PageCount <= 0 && len(z.Pages) == 0 {
 		log.Warning.Printf("PageCount is 0")
 		return nil
 	}
@@ -110,6 +111,29 @@ func (z *Zip) readContent(zr *zip.Reader) error {
 			z.pageMap[pageUUID] = index
 			z.Pages[index].DocPage = index
 		}
+	} else if z.Content.CPagesData != nil && len(z.Content.CPagesData.Pages) > 0 {
+		// Firmware 3.0+: build page map from cPages
+		cpages := make([]CPageEntry, len(z.Content.CPagesData.Pages))
+		copy(cpages, z.Content.CPagesData.Pages)
+		sort.Slice(cpages, func(i, j int) bool {
+			return cpages[i].Idx.Value < cpages[j].Idx.Value
+		})
+
+		z.pageMap = make(map[string]int)
+		z.Pages = make([]Page, 0, len(cpages))
+		idx := 0
+		for _, cp := range cpages {
+			if cp.Deleted != nil {
+				continue
+			}
+			z.pageMap[cp.ID] = idx
+			docPage := -1
+			if cp.Redir != nil {
+				docPage = cp.Redir.Value
+			}
+			z.Pages = append(z.Pages, Page{DocPage: docPage})
+			idx++
+		}
 	} else {
 		// instantiate the slice of pages
 		z.Pages = make([]Page, z.Content.PageCount)
@@ -139,6 +163,9 @@ func (z *Zip) readPagedata(zr *zip.Reader) error {
 	sc := bufio.NewScanner(file)
 	var i int = 0
 	for sc.Scan() {
+		if i >= len(z.Pages) {
+			break
+		}
 		line := sc.Text()
 		z.Pages[i].Pagedata = line
 		i++
@@ -183,6 +210,22 @@ func (z *Zip) readData(zr *zip.Reader) error {
 	files, err := zipExtFinder(zr, ".rm")
 	if err != nil {
 		return err
+	}
+
+	// Last-resort fallback: build pageMap from discovered .rm files when
+	// neither pages, redirectionPageMap, nor cPages were available.
+	if z.pageMap == nil && len(files) > 0 {
+		z.pageMap = make(map[string]int, len(files))
+		if len(z.Pages) < len(files) {
+			z.Pages = make([]Page, len(files))
+		}
+		for i, file := range files {
+			name, _ := splitExt(file.FileInfo().Name())
+			if _, parseErr := uuid.Parse(name); parseErr == nil {
+				z.pageMap[name] = i
+				z.Pages[i].DocPage = i
+			}
+		}
 	}
 
 	for _, file := range files {

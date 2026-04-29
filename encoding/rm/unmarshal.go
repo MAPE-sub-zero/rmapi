@@ -13,6 +13,16 @@ func (rm *Rm) UnmarshalBinary(data []byte) error {
 	if err := r.checkHeader(); err != nil {
 		return err
 	}
+
+	if r.version == V6 {
+		result, err := parseV6(data)
+		if err != nil {
+			return err
+		}
+		*rm = *result
+		return nil
+	}
+
 	rm.Version = r.version
 
 	nbLayers, err := r.readNumber()
@@ -70,6 +80,8 @@ func (r *reader) checkHeader() error {
 		r.version = V5
 	case HeaderV3:
 		r.version = V3
+	case HeaderV6:
+		r.version = V6
 	default:
 		return fmt.Errorf("Unknown header")
 	}

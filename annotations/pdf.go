@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-
+	"math"
 	"os"
 
 	"github.com/juruen/rmapi/archive"
@@ -43,8 +43,8 @@ func CreatePdfGenerator(zipName, outputFilePath string, options PdfGeneratorOpti
 	return &PdfGenerator{zipName: zipName, outputFilePath: outputFilePath, options: options}
 }
 
-func normalized(p1 rm.Point, ratioX float64) (float64, float64) {
-	return float64(p1.X) * ratioX, float64(p1.Y) * ratioX
+func normalized(p1 rm.Point, scale, xShift float64) (float64, float64) {
+	return float64(p1.X)*scale + xShift, float64(p1.Y) * scale
 }
 
 func (p *PdfGenerator) Generate() error {
@@ -92,8 +92,10 @@ func (p *PdfGenerator) Generate() error {
 	for _, pageAnnotations := range zip.Pages {
 		hasContent := pageAnnotations.Data != nil
 
-		// do not add a page when there are no annotations
-		if !p.options.AllPages && !hasContent {
+		// For PDFs, always include all pages so the full document is
+		// preserved with annotations overlaid. For notebooks (no source
+		// PDF), skip blank pages unless -a is given.
+		if !hasContent && !p.options.AllPages && p.pdfReader == nil {
 			continue
 		}
 		//1 based, redirected page
@@ -104,23 +106,31 @@ func (p *PdfGenerator) Generate() error {
 			return err
 		}
 
-		ratio := c.Height() / c.Width()
-
-		var scale float64
-		if ratio < 1.33 {
-			scale = c.Width() / DeviceWidth
-		} else {
-			scale = c.Height() / DeviceHeight
-		}
 		if page == nil {
 			log.Error.Fatal("page is null")
 		}
-
-		if err != nil {
-			return err
-		}
 		if !hasContent {
 			continue
+		}
+
+		var scale float64
+		var xShift float64
+		isV6Pdf := pageAnnotations.Data.Version == rm.V6 && pageAnnotations.DocPage >= 0
+
+		if isV6Pdf {
+			// v6 PDF-backed pages: DPI-based scale (226 DPI device → 72 DPI PDF).
+			// The v6 parser adds +Width/2 to X so that x=Width/2 is page center;
+			// xShift compensates so that maps to c.Width()/2 in PDF points.
+			scale = 72.0 / 226.0
+			xShift = c.Width()/2 - float64(rm.Width)/2*scale
+		} else {
+			// v3/v5, v6 blank/added pages, or notebooks
+			ratio := c.Height() / c.Width()
+			if ratio < 1.33 {
+				scale = c.Width() / DeviceWidth
+			} else {
+				scale = c.Height() / DeviceHeight
+			}
 		}
 
 		contentCreator := contentstream.NewContentCreator()
@@ -137,8 +147,8 @@ func (p *PdfGenerator) Generate() error {
 
 				if line.BrushType == rm.HighlighterV5 {
 					last := len(line.Points) - 1
-					x1, y1 := normalized(line.Points[0], scale)
-					x2, _ := normalized(line.Points[last], scale)
+					x1, y1 := normalized(line.Points[0], scale, xShift)
+					x2, _ := normalized(line.Points[last], scale, xShift)
 					// make horizontal lines only, use y1
 					width := scale * 30
 					y1 += width / 2
@@ -155,11 +165,25 @@ func (p *PdfGenerator) Generate() error {
 				} else {
 					path := draw.NewPath()
 					for i := 0; i < len(line.Points); i++ {
-						x1, y1 := normalized(line.Points[i], scale)
+						x1, y1 := normalized(line.Points[i], scale, xShift)
 						path = path.AppendPoint(draw.NewPoint(x1, c.Height()-y1))
 					}
 
-					contentCreator.Add_w(float64(line.BrushSize*6.0 - 10.8))
+					var lineWidth float64
+					if pageAnnotations.Data.Version == rm.V6 {
+						// v6: per-point Width is in device pixels; average and scale to PDF points.
+						var totalW float64
+						for _, pt := range line.Points {
+							totalW += float64(pt.Width)
+						}
+						lineWidth = totalW / float64(len(line.Points)) * scale
+					} else {
+						lineWidth = float64(line.BrushSize*6.0 - 10.8)
+					}
+					if lineWidth < 0.1 {
+						lineWidth = 0.1
+					}
+					contentCreator.Add_w(lineWidth)
 
 					switch line.BrushColor {
 					case rm.Black:
@@ -168,6 +192,10 @@ func (p *PdfGenerator) Generate() error {
 						contentCreator.Add_rg(0.0, 0.0, 0.0)
 					case rm.Grey:
 						contentCreator.Add_rg(0.8, 0.8, 0.8)
+					case rm.Blue:
+						contentCreator.Add_rg(0.0, 0.38, 0.8)
+					case rm.Red:
+						contentCreator.Add_rg(0.85, 0.03, 0.03)
 					}
 
 					//TODO: use bezier
@@ -177,6 +205,31 @@ func (p *PdfGenerator) Generate() error {
 				}
 			}
 		}
+		for _, hl := range pageAnnotations.Data.Highlights {
+			for _, rect := range hl.Rects {
+				// Highlight rects don't have the +Width/2 X offset that strokes do;
+				// for v6 PDF pages, x=0 is at the horizontal center of the page.
+				hlXOff := xShift
+				if isV6Pdf {
+					hlXOff = c.Width() / 2
+				}
+				x1 := rect.X*scale + hlXOff
+				y1 := c.Height() - rect.Y*scale
+				x2 := (rect.X+rect.W)*scale + hlXOff
+				y2 := c.Height() - (rect.Y+rect.H)*scale
+
+				lineDef := annotator.LineAnnotationDef{X1: x1, Y1: y2, X2: x2, Y2: y1}
+				lineDef.LineColor = pdf.NewPdfColorDeviceRGB(1.0, 1.0, 0.0)
+				lineDef.Opacity = 0.3
+				lineDef.LineWidth = math.Abs(y1 - y2)
+				ann, err := annotator.CreateLineAnnotation(lineDef)
+				if err != nil {
+					continue
+				}
+				page.AddAnnotation(ann)
+			}
+		}
+
 		contentCreator.Add_Q()
 		drawingOperations := contentCreator.Operations().String()
 		pageContentStreams, err := page.GetAllContentStreams()
