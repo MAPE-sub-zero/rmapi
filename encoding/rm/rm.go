@@ -61,16 +61,25 @@ const (
 	Height int = 1872
 )
 
-// BrushColor defines the 3 colors of the brush.
+// BrushColor defines color codes for brushes and highlights.
+// Values match rmscene's PenColor enum.
 type BrushColor uint32
 
-// Mapping of the colors.
 const (
-	Black BrushColor = 0
-	Grey  BrushColor = 1
-	White BrushColor = 2
-	Blue  BrushColor = 6
-	Red   BrushColor = 7
+	Black            BrushColor = 0
+	Grey             BrushColor = 1
+	White            BrushColor = 2
+	HighlightYellow  BrushColor = 3
+	HighlightGreen   BrushColor = 4
+	HighlightPink    BrushColor = 5
+	Blue             BrushColor = 6
+	Red              BrushColor = 7
+	GreyOverlap      BrushColor = 8
+	HighlightDynamic BrushColor = 9 // RGB carried in Highlight.ColorRGBA
+	Green2           BrushColor = 10
+	Cyan             BrushColor = 11
+	Magenta          BrushColor = 12
+	Yellow2          BrushColor = 13
 )
 
 // BrushType respresents the type of brush.
@@ -118,10 +127,14 @@ type HighlightRect struct {
 }
 
 // A Highlight represents a text highlight annotation (v6).
+//
+// ColorRGBA is set when Color == HighlightDynamic and the .rm file carried an
+// explicit RGBA value (firmware 3.6+). Order is R, G, B, A.
 type Highlight struct {
-	Color BrushColor
-	Text  string
-	Rects []HighlightRect
+	Color     BrushColor
+	ColorRGBA *[4]uint8
+	Text      string
+	Rects     []HighlightRect
 }
 
 // A Rm represents an entire .rm file

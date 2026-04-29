@@ -154,7 +154,8 @@ func (p *PdfGenerator) Generate() error {
 					y1 += width / 2
 
 					lineDef := annotator.LineAnnotationDef{X1: x1 - 1, Y1: c.Height() - y1, X2: x2, Y2: c.Height() - y1}
-					lineDef.LineColor = pdf.NewPdfColorDeviceRGB(1.0, 1.0, 0.0) //yellow
+					r, g, b := highlightRGB(line.BrushColor, nil)
+					lineDef.LineColor = pdf.NewPdfColorDeviceRGB(r, g, b)
 					lineDef.Opacity = 0.5
 					lineDef.LineWidth = width
 					ann, err := annotator.CreateLineAnnotation(lineDef)
@@ -219,7 +220,8 @@ func (p *PdfGenerator) Generate() error {
 				y2 := c.Height() - (rect.Y+rect.H)*scale
 
 				lineDef := annotator.LineAnnotationDef{X1: x1, Y1: y2, X2: x2, Y2: y1}
-				lineDef.LineColor = pdf.NewPdfColorDeviceRGB(1.0, 1.0, 0.0)
+				r, g, b := highlightRGB(hl.Color, hl.ColorRGBA)
+				lineDef.LineColor = pdf.NewPdfColorDeviceRGB(r, g, b)
 				lineDef.Opacity = 0.3
 				lineDef.LineWidth = math.Abs(y1 - y2)
 				ann, err := annotator.CreateLineAnnotation(lineDef)
@@ -308,4 +310,28 @@ func (p *PdfGenerator) addBackgroundPage(c *creator.Creator, pageNum int) (*pdf.
 		})
 	}
 	return page, nil
+}
+
+// highlightRGB resolves a v6 highlight color to RGB components in [0,1].
+// rgba (when non-nil) overrides the enum and carries an explicit color from
+// firmware 3.6+. Falls back to yellow for unknown codes.
+func highlightRGB(c rm.BrushColor, rgba *[4]uint8) (r, g, b float64) {
+	if rgba != nil {
+		return float64(rgba[0]) / 255, float64(rgba[1]) / 255, float64(rgba[2]) / 255
+	}
+	switch c {
+	case rm.HighlightYellow, rm.Yellow2:
+		return 1.0, 0.93, 0.0
+	case rm.HighlightGreen, rm.Green2:
+		return 0.36, 0.86, 0.36
+	case rm.HighlightPink, rm.Magenta:
+		return 1.0, 0.45, 0.75
+	case rm.Blue, rm.Cyan:
+		return 0.40, 0.75, 1.0
+	case rm.Red:
+		return 1.0, 0.45, 0.45
+	case rm.Black, rm.Grey, rm.GreyOverlap:
+		return 0.7, 0.7, 0.7
+	}
+	return 1.0, 0.93, 0.0
 }

@@ -502,6 +502,22 @@ func parseV6GlyphBlock(r *v6Reader, blockEnd int) (*Highlight, error) {
 	}
 	r.pos = rectsSubEnd
 
+	// Optional explicit RGBA color (firmware 3.6+, tag 10, byte4).
+	// Packed uint32 unpacks to (R, G, B, A) per rmscene's read_color_optional.
+	var rgba *[4]uint8
+	if r.pos < valueEnd && r.checkTag(10, tagByte4) {
+		packed, err := r.readUint32()
+		if err != nil {
+			return nil, err
+		}
+		rgba = &[4]uint8{
+			uint8((packed >> 16) & 0xFF),
+			uint8((packed >> 8) & 0xFF),
+			uint8(packed & 0xFF),
+			uint8((packed >> 24) & 0xFF),
+		}
+	}
+
 	r.pos = valueEnd
 
 	if len(rects) == 0 {
@@ -509,8 +525,9 @@ func parseV6GlyphBlock(r *v6Reader, blockEnd int) (*Highlight, error) {
 	}
 
 	return &Highlight{
-		Color: BrushColor(color),
-		Text:  text,
-		Rects: rects,
+		Color:     BrushColor(color),
+		ColorRGBA: rgba,
+		Text:      text,
+		Rects:     rects,
 	}, nil
 }
