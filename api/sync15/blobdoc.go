@@ -214,7 +214,7 @@ func (d *BlobDoc) LineWithSchema(schema string) string {
 // Mirror updates the document to be the same as the remote
 func (d *BlobDoc) Mirror(e *Entry, r RemoteStorage) error {
 	d.Entry = *e
-	entryIndex, err := r.GetReader(e.Hash, e.DocumentID)
+	entryIndex, err := r.GetReader(e.Hash, addExt(e.DocumentID, archive.DocSchemaExt))
 	if err != nil {
 		return err
 	}
