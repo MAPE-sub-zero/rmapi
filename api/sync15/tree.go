@@ -153,10 +153,13 @@ func parseIndex(f io.Reader) ([]*Entry, string, error) {
 func (t *HashTree) IndexReader() (io.Reader, error) {
 	var w bytes.Buffer
 
-	schemaVersion := t.SchemaVersion
-	if schemaVersion == "" {
-		schemaVersion = SchemaVersionV3
-	}
+	// t.SchemaVersion records the format read from the server during Mirror().
+	// For writes, always emit v4 root indexes: current servers reject new
+	// v3-format root docSchema uploads even when the v3 HashEntries hash
+	// matches the body. Rehash() always SHA-256s the serialized output, so
+	// RMAPI_FORCE_SCHEMA_VERSION=3 changes the body schema but not the hash
+	// algorithm — use it only to inspect failure modes, not as a working mode.
+	schemaVersion := SchemaVersionV4
 
 	if envSchema := os.Getenv("RMAPI_FORCE_SCHEMA_VERSION"); envSchema != "" {
 		log.Info.Printf("forcing schema version to %s via RMAPI_FORCE_SCHEMA_VERSION", envSchema)
@@ -228,42 +231,19 @@ func (t *HashTree) Remove(id string) error {
 }
 
 func (t *HashTree) Rehash() error {
-	schemaVersion := t.SchemaVersion
-	if schemaVersion == "" {
-		schemaVersion = SchemaVersionV3
+	reader, err := t.IndexReader()
+	if err != nil {
+		return err
 	}
 
-	if envSchema := os.Getenv("RMAPI_FORCE_SCHEMA_VERSION"); envSchema != "" {
-		schemaVersion = envSchema
+	schemaBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return err
 	}
 
-	var hash string
-	var err error
-
-	if schemaVersion == SchemaVersionV3 {
-		entries := []*Entry{}
-		for _, e := range t.Docs {
-			entries = append(entries, &e.Entry)
-		}
-		hash, err = HashEntries(entries)
-		if err != nil {
-			return err
-		}
-	} else {
-		reader, err := t.IndexReader()
-		if err != nil {
-			return err
-		}
-
-		schemaBytes, err := io.ReadAll(reader)
-		if err != nil {
-			return err
-		}
-
-		hasher := sha256.New()
-		hasher.Write(schemaBytes)
-		hash = hex.EncodeToString(hasher.Sum(nil))
-	}
+	hasher := sha256.New()
+	hasher.Write(schemaBytes)
+	hash := hex.EncodeToString(hasher.Sum(nil))
 
 	log.Info.Println("New root hash: ", hash)
 	t.Hash = hash
@@ -300,7 +280,6 @@ func (t *HashTree) Mirror(r RemoteStorage, maxconcurrent int) error {
 		return fmt.Errorf("cannot get root hash %v", err)
 	}
 	defer rootIndexReader.Close()
-
 	entries, schema, err := parseIndex(rootIndexReader)
 	if err != nil {
 		return fmt.Errorf("cannot parse rootIndex, %v", err)
@@ -395,7 +374,7 @@ func BuildTree(provider RemoteStorage) (*HashTree, error) {
 	tree.SchemaVersion = schema
 
 	for _, e := range entries {
-		f, err := provider.GetReader(e.Hash, e.DocumentID)
+		f, err := provider.GetReader(e.Hash, addExt(e.DocumentID, archive.DocSchemaExt))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read blob %s: %w", e.DocumentID, err)
 		}

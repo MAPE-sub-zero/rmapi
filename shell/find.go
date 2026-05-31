@@ -9,7 +9,7 @@ import (
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/model"
-	flag "github.com/ogier/pflag"
+	"github.com/ogier/pflag"
 )
 
 // tagSlice implements flag.Value to collect multiple --tag flags
@@ -25,28 +25,28 @@ func (t *tagSlice) Set(value string) error {
 }
 
 func findCmd(ctx *ShellCtxt) *ishell.Cmd {
+	longHelp := `Usage: find [options] [dir] [regexp]`
+
 	return &ishell.Cmd{
 		Name:      "find",
-		Help:      "find files recursively, usage: find [options] [dir] [regexp]",
+		Help:      "find files recursively",
 		Completer: createDirCompleter(ctx),
+		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
-			flagSet := flag.NewFlagSet("find", flag.ContinueOnError)
+			flagSet := pflag.NewFlagSet("find", pflag.ContinueOnError)
 			var compact bool
 			var tags tagSlice
 			var starred bool
 			flagSet.BoolVarP(&compact, "compact", "c", false, "compact format")
 			flagSet.Var(&tags, "tag", "filter by tag (can be specified multiple times, matches files with ANY of the tags)")
 			flagSet.BoolVar(&starred, "starred", false, "only show starred files")
-			if err := flagSet.Parse(c.Args); err != nil {
-				if err != flag.ErrHelp {
-					c.Err(err)
-				}
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
 				return
 			}
 			argRest := flagSet.Args()
 
 			starredFilterEnabled := false
-			flagSet.Visit(func(f *flag.Flag) {
+			flagSet.Visit(func(f *pflag.Flag) {
 				if f.Name == "starred" {
 					starredFilterEnabled = true
 				}

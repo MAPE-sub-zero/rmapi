@@ -7,7 +7,7 @@ import (
 	"path"
 	"strings"
 
-	"flag"
+	flag "github.com/ogier/pflag"
 
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/log"
@@ -15,18 +15,17 @@ import (
 )
 
 func mputCmd(ctx *ShellCtxt) *ishell.Cmd {
+	longHelp := `Usage: mput [options] <local_dir> <remote_dir>`
 	return &ishell.Cmd{
 		Name:      "mput",
 		Help:      "recursively copy local files to remote directory",
+		LongHelp:  longHelp,
 		Completer: createFsEntryCompleter(),
 		Func: func(c *ishell.Context) {
 			flagSet := flag.NewFlagSet("mput", flag.ContinueOnError)
 			src := flagSet.String("src", "", "source dir")
 
-			if err := flagSet.Parse(c.Args); err != nil {
-				if err != flag.ErrHelp {
-					c.Err(err)
-				}
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
 				return
 			}
 			argRest := flagSet.Args()
@@ -213,7 +212,7 @@ func putFilesAndDirs(pCtx *ShellCtxt, pC *ishell.Context, localDir string, depth
 				pC.Printf("uploading: [%s]...", name)
 
 				fullName := path.Join(localDir, name)
-				doc, err := pCtx.api.UploadDocument(pCtx.node.Id(), fullName, false, nil)
+				doc, err := pCtx.api.UploadDocument(pCtx.node.Id(), fullName, false, nil, nil, nil, nil)
 
 				if err != nil {
 					pC.Err(fmt.Errorf("failed to upload file '%s', %v", name, err))

@@ -3,23 +3,23 @@ package shell
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/util"
 	"github.com/ogier/pflag"
+	pdf "github.com/unidoc/unipdf/v3/model"
 )
 
 func putCmd(ctx *ShellCtxt) *ishell.Cmd {
+	longHelp := `Usage: put [options] <local_file> [remote_directory]`
+
 	return &ishell.Cmd{
 		Name:      "put",
 		Help:      "copy a local document to cloud",
 		Completer: createFsEntryCompleter(),
-		LongHelp: `Usage: put [options] <local_file> [remote_directory]
-
-Options:
-  --force              Overwrite existing file (recreates document)
-  --content-only       Replace PDF content only (preserves document metadata)
-  --coverpage=<0|1>    Set coverpage (0 to disable, 1 to set first page as cover)`,
+		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
 			if len(c.Args) == 0 {
 				c.Err(errors.New("missing source file"))
@@ -28,14 +28,14 @@ Options:
 
 			// Parse flags using pflag
 			flags := pflag.NewFlagSet("put", pflag.ContinueOnError)
-			flags.SetOutput(nil) // Suppress pflag's error output, we'll handle it
 
-			force := flags.Bool("force", false, "overwrite existing file")
-			contentOnly := flags.Bool("content-only", false, "replace PDF content only")
-			coverpage := flags.String("coverpage", "", "set coverpage (0 or 1)")
+			force := flags.Bool("force", false, "Overwrite existing file (recreates document)")
+			contentOnly := flags.Bool("content-only", false, "Overwrite existing file (recreates document)")
+			coverpage := flags.String("coverpage", "", "Set coverpage (0 to disable, 1 to set first page as cover)")
+			currentpageStr := flags.String("currentpage", "", "Set current page (1-indexed)")
+			contrast := flags.String("contrast", "", "Set contrast filter (fullpage, off, adaptive)")
 
-			if err := flags.Parse(c.Args); err != nil {
-				c.Err(err)
+			if !processFlagSet(flags, longHelp, c.Args, c) {
 				return
 			}
 
@@ -62,6 +62,64 @@ Options:
 					coverpageFlag = &val
 				default:
 					c.Err(errors.New("--coverpage value must be 0 or 1"))
+					return
+				}
+			}
+
+			_, srcExt := util.DocPathToName(args[0])
+
+			var currentPageFlag *int
+			var pageCountFlag *int
+			if *currentpageStr != "" {
+				if srcExt != "pdf" {
+					c.Err(errors.New("--currentpage is only supported for PDF files"))
+					return
+				}
+				val, err := strconv.Atoi(*currentpageStr)
+				if err != nil || val < 1 {
+					c.Err(errors.New("--currentpage must be a positive integer"))
+					return
+				}
+
+				f, err := os.Open(args[0])
+				if err != nil {
+					c.Err(fmt.Errorf("failed to open file: %v", err))
+					return
+				}
+				reader, err := pdf.NewPdfReader(f)
+				f.Close()
+				if err != nil {
+					c.Err(fmt.Errorf("failed to read PDF: %v", err))
+					return
+				}
+				numPages, err := reader.GetNumPages()
+				if err != nil {
+					c.Err(fmt.Errorf("failed to get page count: %v", err))
+					return
+				}
+				if val > numPages {
+					c.Err(fmt.Errorf("--currentpage %d exceeds page count (%d)", val, numPages))
+					return
+				}
+				pageCountFlag = &numPages
+
+				val-- // convert 1-indexed to 0-indexed
+				currentPageFlag = &val
+			}
+
+			var contrastFlag *string
+			if *contrast != "" {
+				if srcExt != "pdf" && srcExt != "epub" {
+					c.Err(errors.New("--contrast is only supported for PDF and epub files"))
+					return
+				}
+				switch *contrast {
+				case "fullpage", "off":
+					contrastFlag = contrast
+				case "adaptive":
+					// leave nil to omit field
+				default:
+					c.Err(errors.New("--contrast must be fullpage, off, or adaptive"))
 					return
 				}
 			}
@@ -95,7 +153,7 @@ Options:
 					// Document doesn't exist, create new one
 					c.Printf("uploading: [%s]...", srcName)
 					dstDir := node.Id()
-					document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag)
+					document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag, currentPageFlag, pageCountFlag, contrastFlag)
 					if err != nil {
 						c.Err(fmt.Errorf("failed to upload file [%s]: %v", srcName, err))
 						return
@@ -157,7 +215,7 @@ Options:
 
 				// Upload new document
 				dstDir := node.Id()
-				document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag)
+				document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag, currentPageFlag, pageCountFlag, contrastFlag)
 				if err != nil {
 					c.Err(fmt.Errorf("failed to upload replacement file [%s]: %v", srcName, err))
 					return
@@ -171,7 +229,7 @@ Options:
 			// File doesn't exist, upload new document
 			c.Printf("uploading: [%s]...", srcName)
 			dstDir := node.Id()
-			document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag)
+			document, err := ctx.api.UploadDocument(dstDir, srcName, true, coverpageFlag, currentPageFlag, pageCountFlag, contrastFlag)
 
 			if err != nil {
 				c.Err(fmt.Errorf("failed to upload file [%s] %v", srcName, err))

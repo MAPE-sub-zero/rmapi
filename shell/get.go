@@ -11,18 +11,18 @@ import (
 )
 
 func getCmd(ctx *ShellCtxt) *ishell.Cmd {
+	longHelp := `Usage: get [--id] <path|id>`
+
 	return &ishell.Cmd{
 		Name:      "get",
-		Help:      "copy remote file to local, usage: get [--id] <path|id>",
+		Help:      "copy remote file to local",
 		Completer: createEntryCompleter(ctx),
+		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
 			flagSet := flag.NewFlagSet("get", flag.ContinueOnError)
 			var byId bool
 			flagSet.BoolVar(&byId, "id", false, "interpret argument as document ID instead of path")
-			if err := flagSet.Parse(c.Args); err != nil {
-				if err != flag.ErrHelp {
-					c.Err(err)
-				}
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
 				return
 			}
 			args := flagSet.Args()

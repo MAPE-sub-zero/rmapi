@@ -1,6 +1,8 @@
 package sync15
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"strings"
 	"testing"
@@ -94,6 +96,48 @@ blah:0:someid:0:10
 	if strIndex != expected {
 		t.Errorf("index did not match %s", strIndex)
 		return
+	}
+}
+
+// TestRootIndexWritesV4WhenMirroredV3 is the regression test for the bug
+// introduced in f5c7b9c: a tree whose SchemaVersion was read as v3 from the
+// server must still produce a v4 root docSchema on write.
+func TestRootIndexWritesV4WhenMirroredV3(t *testing.T) {
+	tree := HashTree{
+		SchemaVersion: SchemaVersionV3, // simulates a tree mirrored from a v3 root
+	}
+	doc := &BlobDoc{
+		Entry: Entry{Hash: "somehash", DocumentID: "someid"},
+	}
+	doc.AddFile(&Entry{Hash: "filehash", DocumentID: "someid.pdf", Size: 100})
+	tree.Add(doc)
+
+	reader, err := tree.IndexReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, schema, err := parseIndex(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schema != SchemaVersionV4 {
+		t.Errorf("IndexReader() produced schema %s for v3-mirrored tree; want v4", schema)
+	}
+
+	if err := tree.Rehash(); err != nil {
+		t.Fatal(err)
+	}
+	reader2, _ := tree.IndexReader()
+	body2, _ := io.ReadAll(reader2)
+	h := sha256.Sum256(body2)
+	expectedHash := hex.EncodeToString(h[:])
+	if tree.Hash != expectedHash {
+		t.Errorf("Rehash() = %s; want sha256(IndexReader) = %s", tree.Hash, expectedHash)
 	}
 }
 
