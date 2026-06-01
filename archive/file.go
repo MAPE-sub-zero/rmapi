@@ -100,6 +100,31 @@ type PageTag struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+// CPageNumberValue is a CRDT numeric value used in firmware 3.0+ content files.
+type CPageNumberValue struct {
+	Timestamp string `json:"timestamp"`
+	Value     int    `json:"value"`
+}
+
+// CPageStringValue is a CRDT string value used in firmware 3.0+ content files.
+type CPageStringValue struct {
+	Timestamp string `json:"timestamp"`
+	Value     string `json:"value"`
+}
+
+// CPageEntry represents a single page in the cPages structure.
+type CPageEntry struct {
+	ID      string            `json:"id"`
+	Idx     CPageStringValue  `json:"idx"`
+	Deleted *CPageNumberValue `json:"deleted,omitempty"`
+	Redir   *CPageNumberValue `json:"redir,omitempty"`
+}
+
+// CPages is the firmware 3.0+ page list format, replacing pages/redirectionPageMap.
+type CPages struct {
+	Pages []CPageEntry `json:"pages"`
+}
+
 // Content represents the structure of a .content json file.
 type Content struct {
 	DummyDocument bool          `json:"dummyDocument"`
@@ -114,14 +139,16 @@ type Content struct {
 	// Orientation can take "portrait" or "landscape".
 	Orientation string `json:"orientation"`
 	PageCount   int    `json:"pageCount"`
-	// Pages is a list of page IDs
+	// Pages is a list of page IDs (legacy format)
 	Pages           []string  `json:"pages"`
 	PageTags        []PageTag `json:"pageTags"`
 	DocumentTags    []Tag     `json:"tags"`
 	RedirectionMap  []int     `json:"redirectionPageMap"`
-	TextScale       float64   `json:"textScale"`
+	TextScale            float64 `json:"textScale"`
 	CoverPageNumber      *int    `json:"coverPageNumber,omitempty"`
 	ViewBackgroundFilter *string `json:"viewBackgroundFilter,omitempty"`
+	// CPages is the firmware 3.0+ page list with CRDT ordering and PDF page mapping
+	CPagesData *CPages `json:"cPages,omitempty"`
 
 	Transform *Transform `json:"-"`
 }
