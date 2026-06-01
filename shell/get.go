@@ -5,11 +5,13 @@ import (
 	"fmt"
 
 	"github.com/abiosoft/ishell"
+	"github.com/juruen/rmapi/model"
 	"github.com/juruen/rmapi/util"
+	flag "github.com/ogier/pflag"
 )
 
 func getCmd(ctx *ShellCtxt) *ishell.Cmd {
-	longHelp := `Usage: get <remote_file>`
+	longHelp := `Usage: get [--id] <path|id>`
 
 	return &ishell.Cmd{
 		Name:      "get",
@@ -17,25 +19,43 @@ func getCmd(ctx *ShellCtxt) *ishell.Cmd {
 		Completer: createEntryCompleter(ctx),
 		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
-			if checkHelp(longHelp, c.Args, c) {
+			flagSet := flag.NewFlagSet("get", flag.ContinueOnError)
+			var byId bool
+			flagSet.BoolVar(&byId, "id", false, "interpret argument as document ID instead of path")
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
+				return
+			}
+			args := flagSet.Args()
+
+			if len(args) == 0 {
+				c.Err(errors.New("missing source file or id"))
 				return
 			}
 
-			if len(c.Args) == 0 {
-				c.Err(errors.New("missing source file"))
+			srcArg := args[0]
+			var node *model.Node
+			var err error
+
+			if byId {
+				node = ctx.api.Filetree().NodeById(srcArg)
+				if node == nil {
+					c.Err(errors.New("document with given ID doesn't exist"))
+					return
+				}
+			} else {
+				node, err = ctx.api.Filetree().NodeByPath(srcArg, ctx.node)
+				if err != nil {
+					c.Err(errors.New("file doesn't exist"))
+					return
+				}
+			}
+
+			if node.IsDirectory() {
+				c.Err(errors.New("cannot download a directory"))
 				return
 			}
 
-			srcName := c.Args[0]
-
-			node, err := ctx.api.Filetree().NodeByPath(srcName, ctx.node)
-
-			if err != nil || node.IsDirectory() {
-				c.Err(errors.New("file doesn't exist"))
-				return
-			}
-
-			c.Println(fmt.Sprintf("downloading: [%s]...", srcName))
+			c.Println(fmt.Sprintf("downloading: [%s]...", node.Name()))
 
 			err = ctx.api.FetchDocument(node.Document.ID, fmt.Sprintf("%s.%s", node.Name(), util.RMDOC))
 
@@ -44,7 +64,7 @@ func getCmd(ctx *ShellCtxt) *ishell.Cmd {
 				return
 			}
 
-			c.Err(errors.New(fmt.Sprintf("Failed to download file %s with %s", srcName, err.Error())))
+			c.Err(errors.New(fmt.Sprintf("Failed to download file %s with %s", node.Name(), err.Error())))
 		},
 	}
 }
