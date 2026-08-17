@@ -141,6 +141,95 @@ func TestRootIndexWritesV4WhenMirroredV3(t *testing.T) {
 	}
 }
 
+// docWithID builds a minimal valid BlobDoc for index tests.
+func docWithID(id string) *BlobDoc {
+	d := &BlobDoc{Entry: Entry{Hash: "h-" + id, DocumentID: id}}
+	d.AddFile(&Entry{Hash: "f-" + id, DocumentID: id + ".metadata", Size: 1})
+	return d
+}
+
+// indexDocIDs returns the document IDs in the order IndexReader emitted them.
+func indexDocIDs(t *testing.T, tree *HashTree) []string {
+	t.Helper()
+	reader, err := tree.IndexReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := parseIndex(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.DocumentID)
+	}
+	return ids
+}
+
+// TestRootIndexIsSortedByDocumentID is the regression test for ddvk/rmapi#75
+// and #76: the cloud rejects a root docSchema whose entries are not sorted by
+// document ID with 400 {"message":"invalid root schema"}. Add() appends, so a
+// tree built in non-sorted order must still serialize sorted.
+func TestRootIndexIsSortedByDocumentID(t *testing.T) {
+	tree := HashTree{SchemaVersion: SchemaVersionV4}
+	for _, id := range []string{"ccc", "aaa", "bbb"} {
+		if err := tree.Add(docWithID(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := indexDocIDs(t, &tree)
+	want := []string{"aaa", "bbb", "ccc"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("root index order = %v; want %v", got, want)
+		}
+	}
+}
+
+// TestRootIndexSortedAfterRemove covers the second way ordering breaks:
+// Remove() swaps the final element into the removed slot, which unsorts the
+// slice, and then only calls Rehash().
+func TestRootIndexSortedAfterRemove(t *testing.T) {
+	tree := HashTree{SchemaVersion: SchemaVersionV4}
+	for _, id := range []string{"aaa", "bbb", "ccc", "ddd"} {
+		if err := tree.Add(docWithID(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Removing "bbb" moves "ddd" into its slot -> aaa, ddd, ccc.
+	if err := tree.Remove("bbb"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := indexDocIDs(t, &tree)
+	want := []string{"aaa", "ccc", "ddd"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("root index order after Remove = %v; want %v", got, want)
+		}
+	}
+
+	// The uploaded hash must still be sha256 of the emitted body.
+	reader, _ := tree.IndexReader()
+	body, _ := io.ReadAll(reader)
+	h := sha256.Sum256(body)
+	if tree.Hash != hex.EncodeToString(h[:]) {
+		t.Errorf("Rehash() = %s; want sha256(IndexReader) = %s",
+			tree.Hash, hex.EncodeToString(h[:]))
+	}
+}
+
 func TestCreateRootIndex(t *testing.T) {
 	tree := HashTree{
 		SchemaVersion: SchemaVersionV4,
