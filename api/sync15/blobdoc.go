@@ -108,6 +108,14 @@ func (d *BlobDoc) IndexReaderWithSchema(schema string) (io.Reader, error) {
 		schema = SchemaVersionV3
 	}
 
+	// Same canonical-order requirement as the root index (see
+	// HashTree.IndexReader). Normally d.Files is already sorted, because
+	// Rehash() -> HashEntries() sorts in place — but AddFile() appends and not
+	// every write path is guaranteed to have rehashed first. Sorting here makes
+	// the emitted body canonical regardless of how we got here; it is in-place
+	// and idempotent, so it cannot disagree with HashEntries' ordering.
+	sort.Slice(d.Files, func(i, j int) bool { return d.Files[i].DocumentID < d.Files[j].DocumentID })
+
 	var w bytes.Buffer
 	w.WriteString(schema)
 	w.WriteString("\n")

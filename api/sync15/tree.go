@@ -166,6 +166,17 @@ func (t *HashTree) IndexReader() (io.Reader, error) {
 		schemaVersion = envSchema
 	}
 
+	// Canonical order: the cloud validates that root index entries are sorted
+	// by document ID and rejects unsorted uploads with
+	// 400 {"message":"invalid root schema"} (ddvk/rmapi#75, #76 — 2026-08-17).
+	//
+	// Mirror() sorts, but two mutators break that order and only call Rehash():
+	// Add() appends, and Remove() swaps the last element into the removed slot.
+	// Sorting here — the single serialization point — keeps the emitted body and
+	// the hash Rehash() derives from it consistent by construction. In-place and
+	// idempotent, matching how HashEntries() canonicalizes at the doc level.
+	sort.Slice(t.Docs, func(i, j int) bool { return t.Docs[i].DocumentID < t.Docs[j].DocumentID })
+
 	w.WriteString(schemaVersion)
 	w.WriteString("\n")
 
