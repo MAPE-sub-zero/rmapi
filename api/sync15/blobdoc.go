@@ -82,6 +82,246 @@ func (d *BlobDoc) ContentHashAndReader() (hash string, reader io.Reader, err err
 	return
 }
 
+// TagUpdateResult is the structured before/after report for a tag write.
+type TagUpdateResult struct {
+	DocumentID     string   `json:"documentId"`
+	Operation      string   `json:"operation"`
+	Changed        bool     `json:"changed"`
+	BeforeRevision string   `json:"beforeRevision"`
+	AfterRevision  string   `json:"afterRevision"`
+	BeforeTags     []string `json:"beforeTags"`
+	AfterTags      []string `json:"afterTags"`
+	PageTagCount   int      `json:"pageTagCount"`
+	ContentHash    string   `json:"contentHash,omitempty"`
+	MetadataHash   string   `json:"metadataHash,omitempty"`
+}
+
+// TagUpdatePlan is a prepared tag write: the report, plus the blobs to upload.
+// A no-op plan has Changed false and nil readers, and must not be uploaded.
+type TagUpdatePlan struct {
+	Result         *TagUpdateResult
+	ContentReader  io.Reader
+	MetadataReader io.Reader
+}
+
+// StaleRevisionError reports that the document moved under the caller.
+type StaleRevisionError struct {
+	DocumentID string
+	Expected   string
+	Actual     string
+}
+
+func (e *StaleRevisionError) Error() string {
+	return fmt.Sprintf(
+		"document %s is at revision %s, not the expected %s; refusing to overwrite a concurrent change",
+		e.DocumentID, e.Actual, e.Expected)
+}
+
+// TagNames returns just the names of a tag set, in order.
+func TagNames(tags []archive.Tag) []string {
+	names := make([]string, 0, len(tags))
+	for _, t := range tags {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
+// PlanTagUpdate enforces the stale-revision precondition, applies op, and
+// prepares the blobs to upload. It reports a no-op rather than writing one.
+//
+// The precondition must be evaluated wherever this is called from inside a
+// Sync operation closure: Sync re-runs its closure against a freshly mirrored
+// tree when the remote generation moved, so a check made once outside that
+// closure would not see the concurrent change it exists to catch.
+//
+// An empty expectedRevision skips the check, for callers that genuinely intend
+// a blind write.
+func PlanTagUpdate(doc *BlobDoc, op TagOp, names []string, expectedRevision string, now int64) (*TagUpdatePlan, error) {
+	before := doc.Hash
+	beforeTags := TagNames(doc.Content.DocumentTags)
+
+	if expectedRevision != "" && expectedRevision != before {
+		return nil, &StaleRevisionError{
+			DocumentID: doc.DocumentID,
+			Expected:   expectedRevision,
+			Actual:     before,
+		}
+	}
+
+	result := &TagUpdateResult{
+		DocumentID:     doc.DocumentID,
+		Operation:      op.String(),
+		BeforeRevision: before,
+		AfterRevision:  before,
+		BeforeTags:     beforeTags,
+		AfterTags:      beforeTags,
+		PageTagCount:   len(doc.Content.PageTags),
+	}
+
+	if !doc.ApplyDocumentTags(op, names, now) {
+		return &TagUpdatePlan{Result: result}, nil
+	}
+
+	contentHash, contentReader, err := doc.ContentHashAndReader()
+	if err != nil {
+		return nil, err
+	}
+	metadataHash, metadataReader, err := doc.MetadataHashAndReader()
+	if err != nil {
+		return nil, err
+	}
+	if err := doc.Rehash(); err != nil {
+		return nil, err
+	}
+
+	result.Changed = true
+	result.AfterRevision = doc.Hash
+	result.AfterTags = TagNames(doc.Content.DocumentTags)
+	result.PageTagCount = len(doc.Content.PageTags)
+	result.ContentHash = contentHash
+	result.MetadataHash = metadataHash
+
+	return &TagUpdatePlan{
+		Result:         result,
+		ContentReader:  contentReader,
+		MetadataReader: metadataReader,
+	}, nil
+}
+
+// VerifyTagWritePayload re-reads a serialised .content blob and checks it says
+// what the caller meant. This is the readback: the in-memory struct being right
+// is not evidence that the bytes on the wire are, and a tag write that silently
+// dropped page tags would be unrecoverable ink loss.
+func VerifyTagWritePayload(payload []byte, wantTags []string, wantPageTags int) error {
+	var readBack archive.Content
+	if err := json.Unmarshal(payload, &readBack); err != nil {
+		return fmt.Errorf("readback: content blob does not parse: %w", err)
+	}
+	got := TagNames(readBack.DocumentTags)
+	if len(got) != len(wantTags) {
+		return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
+	}
+	for i := range got {
+		if got[i] != wantTags[i] {
+			return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
+		}
+	}
+	if len(readBack.PageTags) != wantPageTags {
+		return fmt.Errorf(
+			"readback: content blob has %d page tags, expected %d to be preserved",
+			len(readBack.PageTags), wantPageTags)
+	}
+	return nil
+}
+
+// TagOp selects how a tag write combines with a document's existing tags.
+type TagOp int
+
+const (
+	// TagOpReplace makes the document's tags exactly the supplied set.
+	TagOpReplace TagOp = iota
+	// TagOpAdd adds the supplied tags, leaving existing ones in place.
+	TagOpAdd
+	// TagOpRemove removes the supplied tags, leaving the rest in place.
+	TagOpRemove
+)
+
+func (o TagOp) String() string {
+	switch o {
+	case TagOpAdd:
+		return "add"
+	case TagOpRemove:
+		return "remove"
+	default:
+		return "replace"
+	}
+}
+
+// ApplyTags computes the new document-tag set for an operation, and reports
+// whether it differs from what was there.
+//
+// Tags that survive an operation keep their original timestamp. That is what
+// makes a repeated write a genuine no-op: re-running the same command produces
+// an identical tag set, so changed is false and nothing is uploaded. Stamping
+// every tag with the current time would make each retry look like a change and
+// churn the document's revision.
+func ApplyTags(existing []archive.Tag, op TagOp, names []string, now int64) ([]archive.Tag, bool) {
+	byName := make(map[string]archive.Tag, len(existing))
+	for _, t := range existing {
+		byName[t.Name] = t
+	}
+
+	wanted := make([]string, 0, len(names))
+	named := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n == "" || named[n] {
+			continue
+		}
+		named[n] = true
+		wanted = append(wanted, n)
+	}
+
+	var result []archive.Tag
+	switch op {
+	case TagOpAdd:
+		result = make([]archive.Tag, 0, len(existing)+len(wanted))
+		result = append(result, existing...)
+		for _, n := range wanted {
+			if _, present := byName[n]; !present {
+				result = append(result, archive.Tag{Name: n, Timestamp: now})
+			}
+		}
+	case TagOpRemove:
+		result = make([]archive.Tag, 0, len(existing))
+		for _, t := range existing {
+			if !named[t.Name] {
+				result = append(result, t)
+			}
+		}
+	default:
+		result = make([]archive.Tag, 0, len(wanted))
+		for _, n := range wanted {
+			if prior, present := byName[n]; present {
+				result = append(result, prior)
+			} else {
+				result = append(result, archive.Tag{Name: n, Timestamp: now})
+			}
+		}
+	}
+
+	return result, !tagsEqual(existing, result)
+}
+
+func tagsEqual(a, b []archive.Tag) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ApplyDocumentTags applies op to the document's tags in place and reports
+// whether anything changed. PageTags and the page .rm payloads are never
+// touched. When nothing changes, LastModified is deliberately left alone so a
+// no-op write does not alter the document.
+func (d *BlobDoc) ApplyDocumentTags(op TagOp, names []string, now int64) bool {
+	updated, changed := ApplyTags(d.Content.DocumentTags, op, names, now)
+	if !changed {
+		return false
+	}
+	d.Content.DocumentTags = updated
+	if d.Content.PageTags == nil {
+		d.Content.PageTags = []archive.PageTag{}
+	}
+	d.Metadata.LastModified = strconv.FormatInt(now, 10)
+	d.Metadata.MetadataModified = true
+	return true
+}
+
 func (d *BlobDoc) SetDocumentTags(tags []string) {
 	now := time.Now().UnixMilli()
 	docTags := make([]archive.Tag, len(tags))

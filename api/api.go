@@ -23,6 +23,7 @@ type ApiCtx interface {
 	MoveEntry(src, dstDir *model.Node, name string) (*model.Node, error)
 	DeleteEntry(node *model.Node, recursive, notify bool) error
 	UpdateDocumentTags(docId string, tags []string) error
+	UpdateDocumentTagsWithOptions(docId string, op sync15.TagOp, tags []string, expectedRevision string) (*sync15.TagUpdateResult, error)
 	SyncComplete() error
 	Nuke() error
 	Refresh() (string, int64, error)

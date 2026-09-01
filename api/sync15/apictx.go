@@ -3,6 +3,7 @@ package sync15
 import (
 	"archive/zip"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -464,6 +465,109 @@ func (ctx *ApiCtx) ReplaceDocumentFile(docId, sourceDocPath string, notify bool)
 		}
 		return ctx.blobStorage.UploadBlob(doc.Hash, addExt(doc.DocumentID, archive.DocSchemaExt), indexReader)
 	}, notify)
+}
+
+// UpdateDocumentTagsWithOptions applies a tag operation with a stale-revision
+// precondition, verifies the payload before it is uploaded, and returns a
+// structured before/after report.
+//
+// Three things here are deliberate:
+//
+//   - The no-op is decided before Sync is entered. Sync always rewrites the
+//     root index, so calling it for a write that changes nothing would bump the
+//     generation for no reason and make a retry indistinguishable from an edit.
+//   - The precondition is re-checked inside the operation closure. Sync re-runs
+//     that closure against a freshly mirrored tree when the remote generation
+//     moved, which is exactly the concurrent change the precondition exists to
+//     refuse; checking only once, outside, would let it through on the retry.
+//   - The generation is compared across the call. Sync gives up after ten
+//     attempts by breaking out of its loop and returning saveTree's error,
+//     which is nil, so a caller that trusts its return value can believe a
+//     write landed when the root index was never written. An unchanged
+//     generation means nothing was committed, and that is treated as failure.
+func (ctx *ApiCtx) UpdateDocumentTagsWithOptions(docId string, op TagOp, tags []string, expectedRevision string) (*TagUpdateResult, error) {
+	doc, err := ctx.hashTree.FindDoc(docId)
+	if err != nil {
+		return nil, err
+	}
+	if expectedRevision != "" && expectedRevision != doc.Hash {
+		return nil, &StaleRevisionError{
+			DocumentID: docId,
+			Expected:   expectedRevision,
+			Actual:     doc.Hash,
+		}
+	}
+	if _, changed := ApplyTags(doc.Content.DocumentTags, op, tags, time.Now().UnixMilli()); !changed {
+		names := TagNames(doc.Content.DocumentTags)
+		log.Info.Println("tags already as requested; nothing to write")
+		return &TagUpdateResult{
+			DocumentID:     docId,
+			Operation:      op.String(),
+			Changed:        false,
+			BeforeRevision: doc.Hash,
+			AfterRevision:  doc.Hash,
+			BeforeTags:     names,
+			AfterTags:      names,
+			PageTagCount:   len(doc.Content.PageTags),
+		}, nil
+	}
+
+	generationBefore := ctx.hashTree.Generation
+	var result *TagUpdateResult
+
+	err = Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
+		d, err := t.FindDoc(docId)
+		if err != nil {
+			return err
+		}
+
+		plan, err := PlanTagUpdate(d, op, tags, expectedRevision, time.Now().UnixMilli())
+		if err != nil {
+			return err
+		}
+		result = plan.Result
+		if !plan.Result.Changed {
+			return nil
+		}
+
+		payload, err := json.Marshal(d.Content)
+		if err != nil {
+			return err
+		}
+		if err := VerifyTagWritePayload(payload, plan.Result.AfterTags, plan.Result.PageTagCount); err != nil {
+			return err
+		}
+
+		if err := t.Rehash(); err != nil {
+			return err
+		}
+
+		if err := ctx.blobStorage.UploadBlob(plan.Result.ContentHash, addExt(d.DocumentID, archive.ContentExt), plan.ContentReader); err != nil {
+			return err
+		}
+		if err := ctx.blobStorage.UploadBlob(plan.Result.MetadataHash, addExt(d.DocumentID, archive.MetadataExt), plan.MetadataReader); err != nil {
+			return err
+		}
+
+		indexReader, err := d.IndexReader()
+		if err != nil {
+			return err
+		}
+		return ctx.blobStorage.UploadBlob(d.Hash, addExt(d.DocumentID, archive.DocSchemaExt), indexReader)
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, errors.New("tag update did not run")
+	}
+	if result.Changed && ctx.hashTree.Generation == generationBefore {
+		return nil, fmt.Errorf(
+			"tag write for %s was not committed: root generation is still %d. "+
+				"The document was not changed remotely",
+			docId, generationBefore)
+	}
+	return result, nil
 }
 
 // UpdateDocumentTags updates document-level tags for a given docId
