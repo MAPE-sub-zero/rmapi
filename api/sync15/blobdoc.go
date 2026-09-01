@@ -41,6 +41,11 @@ func NewBlobDoc(name, documentId, colType, parentId string) *BlobDoc {
 }
 
 func (d *BlobDoc) Rehash() error {
+	size := int64(0)
+	for _, f := range d.Files {
+		size += f.Size
+	}
+	d.Size = size
 
 	hash, err := HashEntries(d.Files)
 	if err != nil {
@@ -49,6 +54,60 @@ func (d *BlobDoc) Rehash() error {
 	log.Trace.Println("New doc hash: ", hash)
 	d.Hash = hash
 	return nil
+}
+
+func (d *BlobDoc) ContentHashAndReader() (hash string, reader io.Reader, err error) {
+	jsn, err := json.Marshal(d.Content)
+	if err != nil {
+		return
+	}
+	sha := sha256.New()
+	sha.Write(jsn)
+	hash = hex.EncodeToString(sha.Sum(nil))
+	log.Trace.Println("new content hash", hash)
+	reader = bytes.NewReader(jsn)
+	found := false
+	for _, f := range d.Files {
+		if strings.HasSuffix(f.DocumentID, ".content") {
+			f.Hash = hash
+			f.Size = int64(len(jsn))
+			found = true
+			break
+		}
+	}
+	if !found {
+		err = errors.New("content not found")
+	}
+
+	return
+}
+
+func (d *BlobDoc) SetDocumentTags(tags []string) {
+	now := time.Now().UnixMilli()
+	docTags := make([]archive.Tag, len(tags))
+	for i, t := range tags {
+		docTags[i] = archive.Tag{
+			Name:      t,
+			Timestamp: now,
+		}
+	}
+	d.Content.DocumentTags = docTags
+	if d.Content.PageTags == nil {
+		d.Content.PageTags = []archive.PageTag{}
+	}
+	d.Metadata.LastModified = strconv.FormatInt(now, 10)
+	d.Metadata.MetadataModified = true
+}
+
+func (d *BlobDoc) UpdateDocumentTags(tags []string) error {
+	d.SetDocumentTags(tags)
+	if _, _, err := d.ContentHashAndReader(); err != nil {
+		return err
+	}
+	if _, _, err := d.MetadataHashAndReader(); err != nil {
+		return err
+	}
+	return d.Rehash()
 }
 
 func (d *BlobDoc) MetadataHashAndReader() (hash string, reader io.Reader, err error) {

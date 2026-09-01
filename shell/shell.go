@@ -70,6 +70,7 @@ func RunShell(apiCtx api.ApiCtx, userInfo *api.UserInfo, args []string, jsonOutp
 	ctx.addCmd(shell, cdCmd(ctx))
 	ctx.addCmd(shell, lsCmd(ctx))
 	ctx.addCmd(shell, statCmd(ctx))
+	ctx.addCmd(shell, settagCmd(ctx))
 	ctx.addCmd(shell, findCmd(ctx))
 
 	ctx.addCmd(shell, getCmd(ctx))

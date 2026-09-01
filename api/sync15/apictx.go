@@ -466,6 +466,51 @@ func (ctx *ApiCtx) ReplaceDocumentFile(docId, sourceDocPath string, notify bool)
 	}, notify)
 }
 
+// UpdateDocumentTags updates document-level tags for a given docId
+func (ctx *ApiCtx) UpdateDocumentTags(docId string, tags []string) error {
+	return Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
+		doc, err := t.FindDoc(docId)
+		if err != nil {
+			return err
+		}
+
+		doc.SetDocumentTags(tags)
+
+		contentHash, contentReader, err := doc.ContentHashAndReader()
+		if err != nil {
+			return err
+		}
+
+		metaHash, metaReader, err := doc.MetadataHashAndReader()
+		if err != nil {
+			return err
+		}
+
+		if err := doc.Rehash(); err != nil {
+			return err
+		}
+
+		if err := t.Rehash(); err != nil {
+			return err
+		}
+
+		if err := ctx.blobStorage.UploadBlob(contentHash, addExt(doc.DocumentID, archive.ContentExt), contentReader); err != nil {
+			return err
+		}
+
+		if err := ctx.blobStorage.UploadBlob(metaHash, addExt(doc.DocumentID, archive.MetadataExt), metaReader); err != nil {
+			return err
+		}
+
+		log.Info.Println("Uploading new doc index...", doc.Hash)
+		indexReader, err := doc.IndexReader()
+		if err != nil {
+			return err
+		}
+		return ctx.blobStorage.UploadBlob(doc.Hash, addExt(doc.DocumentID, archive.DocSchemaExt), indexReader)
+	}, true)
+}
+
 // DocumentsFileTree reads your remote documents and builds a file tree
 // structure to represent them
 func DocumentsFileTree(tree *HashTree) *filetree.FileTreeCtx {
