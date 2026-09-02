@@ -82,7 +82,6 @@ func TestParseSettagArgs(t *testing.T) {
 				Tags:             []string{"inbox", "urgent"},
 				Path:             "test-note",
 				ExpectedRevision: "",
-				JSON:             false,
 			},
 		},
 		{
@@ -114,7 +113,7 @@ func TestParseSettagArgs(t *testing.T) {
 		},
 		{
 			name: "--if-revision captured",
-			args: []string{"--if-revision", "abc123", "test-note", "inbox"},
+			args: []string{"--if-revision=abc123", "test-note", "inbox"},
 			want: &settagArgs{
 				Op:               sync15.TagOpReplace,
 				Tags:             []string{"inbox"},
@@ -123,35 +122,23 @@ func TestParseSettagArgs(t *testing.T) {
 			},
 		},
 		{
-			name: "--json captured",
-			args: []string{"--json", "test-note", "inbox"},
-			want: &settagArgs{
-				Op:   sync15.TagOpReplace,
-				Tags: []string{"inbox"},
-				Path: "test-note",
-				JSON: true,
-			},
-		},
-		{
 			name: "flags in one order",
-			args: []string{"--json", "--if-revision", "rev1", "--add", "test-note", "inbox,urgent"},
+			args: []string{"--if-revision=rev1", "--add", "test-note", "inbox,urgent"},
 			want: &settagArgs{
 				Op:               sync15.TagOpAdd,
 				Tags:             []string{"inbox", "urgent"},
 				Path:             "test-note",
 				ExpectedRevision: "rev1",
-				JSON:             true,
 			},
 		},
 		{
 			name: "same flags in a different order",
-			args: []string{"--add", "--json", "--if-revision", "rev1", "test-note", "inbox,urgent"},
+			args: []string{"--add", "--if-revision=rev1", "test-note", "inbox,urgent"},
 			want: &settagArgs{
 				Op:               sync15.TagOpAdd,
 				Tags:             []string{"inbox", "urgent"},
 				Path:             "test-note",
 				ExpectedRevision: "rev1",
-				JSON:             true,
 			},
 		},
 		{
@@ -160,6 +147,15 @@ func TestParseSettagArgs(t *testing.T) {
 			want: &settagArgs{
 				Op:   sync15.TagOpReplace,
 				Tags: []string{"Project Alpha", "Reading List"},
+				Path: "test-note",
+			},
+		},
+		{
+			name: "flags after positionals still parse (pflag interspersed)",
+			args: []string{"test-note", "inbox", "--add"},
+			want: &settagArgs{
+				Op:   sync15.TagOpAdd,
+				Tags: []string{"inbox"},
 				Path: "test-note",
 			},
 		},
@@ -176,7 +172,7 @@ func TestParseSettagArgs(t *testing.T) {
 		{
 			name:    "--if-revision with no value is an error",
 			args:    []string{"--add", "--if-revision"},
-			wantErr: "--if-revision needs a revision",
+			wantErr: "flag needs an argument: --if-revision",
 		},
 		{
 			name:    "missing path and tags",
@@ -187,6 +183,16 @@ func TestParseSettagArgs(t *testing.T) {
 			name:    "missing tags",
 			args:    []string{"test-note"},
 			wantErr: "missing path and/or tags",
+		},
+		{
+			name:    "--json is not a settag flag; JSON output is chosen globally",
+			args:    []string{"--json", "test-note", "inbox"},
+			wantErr: "unknown flag: --json",
+		},
+		{
+			name:    "unknown flag is an error",
+			args:    []string{"--bogus", "test-note", "inbox"},
+			wantErr: "unknown flag: --bogus",
 		},
 	}
 
@@ -206,17 +212,15 @@ func TestParseSettagArgs(t *testing.T) {
 
 type mockApiCtx struct {
 	ft                 *filetree.FileTreeCtx
-	updatedDocID       string
-	updatedTags        []string
 	syncCompleteCalled bool
 
-	withOptionsCalled           bool
-	withOptionsDocID            string
-	withOptionsOp               sync15.TagOp
-	withOptionsTags             []string
-	withOptionsExpectedRevision string
-	withOptionsResult           *sync15.TagUpdateResult
-	withOptionsErr              error
+	called           bool
+	docID            string
+	op               sync15.TagOp
+	tags             []string
+	expectedRevision string
+	result           *sync15.TagUpdateResult
+	err              error
 }
 
 func (m *mockApiCtx) Filetree() *filetree.FileTreeCtx           { return m.ft }
@@ -232,23 +236,18 @@ func (m *mockApiCtx) MoveEntry(src, dstDir *model.Node, name string) (*model.Nod
 	return nil, nil
 }
 func (m *mockApiCtx) DeleteEntry(node *model.Node, recursive, notify bool) error { return nil }
-func (m *mockApiCtx) UpdateDocumentTags(docId string, tags []string) error {
-	m.updatedDocID = docId
-	m.updatedTags = tags
-	return nil
-}
-func (m *mockApiCtx) UpdateDocumentTagsWithOptions(docId string, op sync15.TagOp, tags []string, expectedRevision string) (*sync15.TagUpdateResult, error) {
-	m.withOptionsCalled = true
-	m.withOptionsDocID = docId
-	m.withOptionsOp = op
-	m.withOptionsTags = tags
-	m.withOptionsExpectedRevision = expectedRevision
+func (m *mockApiCtx) UpdateDocumentTags(docId string, op sync15.TagOp, tags []string, expectedRevision string) (*sync15.TagUpdateResult, error) {
+	m.called = true
+	m.docID = docId
+	m.op = op
+	m.tags = tags
+	m.expectedRevision = expectedRevision
 
-	if m.withOptionsErr != nil {
-		return nil, m.withOptionsErr
+	if m.err != nil {
+		return nil, m.err
 	}
-	if m.withOptionsResult != nil {
-		return m.withOptionsResult, nil
+	if m.result != nil {
+		return m.result, nil
 	}
 	return &sync15.TagUpdateResult{
 		DocumentID:     docId,
@@ -295,11 +294,11 @@ func TestSettagCommand(t *testing.T) {
 	err := RunShell(mock, userInfo, []string{"settag", "test-note", "inbox,urgent"}, false)
 	require.NoError(t, err)
 
-	require.True(t, mock.withOptionsCalled)
-	assert.Equal(t, "doc-uuid-123", mock.withOptionsDocID)
-	assert.Equal(t, sync15.TagOpReplace, mock.withOptionsOp)
-	assert.Equal(t, []string{"inbox", "urgent"}, mock.withOptionsTags)
-	assert.Equal(t, "", mock.withOptionsExpectedRevision)
+	require.True(t, mock.called)
+	assert.Equal(t, "doc-uuid-123", mock.docID)
+	assert.Equal(t, sync15.TagOpReplace, mock.op)
+	assert.Equal(t, []string{"inbox", "urgent"}, mock.tags)
+	assert.Equal(t, "", mock.expectedRevision)
 	assert.True(t, mock.syncCompleteCalled)
 
 	node, err := ft.NodeByPath("test-note", ft.Root())
@@ -310,18 +309,18 @@ func TestSettagCommand(t *testing.T) {
 func TestSettagCommandPassesOpAndRevision(t *testing.T) {
 	_, mock, userInfo := newSettagTestFixture()
 
-	err := RunShell(mock, userInfo, []string{"settag", "--add", "--if-revision", "rev-before", "test-note", "urgent"}, false)
+	err := RunShell(mock, userInfo, []string{"settag", "--add", "--if-revision=rev-before", "test-note", "urgent"}, false)
 	require.NoError(t, err)
 
-	require.True(t, mock.withOptionsCalled)
-	assert.Equal(t, sync15.TagOpAdd, mock.withOptionsOp)
-	assert.Equal(t, []string{"urgent"}, mock.withOptionsTags)
-	assert.Equal(t, "rev-before", mock.withOptionsExpectedRevision)
+	require.True(t, mock.called)
+	assert.Equal(t, sync15.TagOpAdd, mock.op)
+	assert.Equal(t, []string{"urgent"}, mock.tags)
+	assert.Equal(t, "rev-before", mock.expectedRevision)
 }
 
 func TestSettagCommandNoOpDoesNotSync(t *testing.T) {
 	_, mock, userInfo := newSettagTestFixture()
-	mock.withOptionsResult = &sync15.TagUpdateResult{
+	mock.result = &sync15.TagUpdateResult{
 		DocumentID:     "doc-uuid-123",
 		Operation:      "replace",
 		Changed:        false,
@@ -339,7 +338,7 @@ func TestSettagCommandNoOpDoesNotSync(t *testing.T) {
 
 func TestSettagCommandChangedCallsSync(t *testing.T) {
 	_, mock, userInfo := newSettagTestFixture()
-	mock.withOptionsResult = &sync15.TagUpdateResult{
+	mock.result = &sync15.TagUpdateResult{
 		DocumentID:     "doc-uuid-123",
 		Operation:      "replace",
 		Changed:        true,
@@ -352,5 +351,15 @@ func TestSettagCommandChangedCallsSync(t *testing.T) {
 	err := RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, false)
 	require.NoError(t, err)
 
+	assert.True(t, mock.syncCompleteCalled)
+}
+
+func TestSettagCommandJSONOutput(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+
+	err := RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+	require.NoError(t, err)
+
+	require.True(t, mock.called)
 	assert.True(t, mock.syncCompleteCalled)
 }

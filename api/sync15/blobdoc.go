@@ -41,11 +41,6 @@ func NewBlobDoc(name, documentId, colType, parentId string) *BlobDoc {
 }
 
 func (d *BlobDoc) Rehash() error {
-	size := int64(0)
-	for _, f := range d.Files {
-		size += f.Size
-	}
-	d.Size = size
 
 	hash, err := HashEntries(d.Files)
 	if err != nil {
@@ -54,32 +49,6 @@ func (d *BlobDoc) Rehash() error {
 	log.Trace.Println("New doc hash: ", hash)
 	d.Hash = hash
 	return nil
-}
-
-func (d *BlobDoc) ContentHashAndReader() (hash string, reader io.Reader, err error) {
-	jsn, err := json.Marshal(d.Content)
-	if err != nil {
-		return
-	}
-	sha := sha256.New()
-	sha.Write(jsn)
-	hash = hex.EncodeToString(sha.Sum(nil))
-	log.Trace.Println("new content hash", hash)
-	reader = bytes.NewReader(jsn)
-	found := false
-	for _, f := range d.Files {
-		if strings.HasSuffix(f.DocumentID, ".content") {
-			f.Hash = hash
-			f.Size = int64(len(jsn))
-			found = true
-			break
-		}
-	}
-	if !found {
-		err = errors.New("content not found")
-	}
-
-	return
 }
 
 // TagUpdateResult is the structured before/after report for a tag write.
@@ -96,12 +65,13 @@ type TagUpdateResult struct {
 	MetadataHash   string   `json:"metadataHash,omitempty"`
 }
 
-// TagUpdatePlan is a prepared tag write: the report, plus the blobs to upload.
-// A no-op plan has Changed false and nil readers, and must not be uploaded.
+// TagUpdatePlan is a prepared tag write: the report, plus the exact bytes to
+// upload. A no-op plan has Changed false and nil blobs, and must not be
+// uploaded.
 type TagUpdatePlan struct {
-	Result         *TagUpdateResult
-	ContentReader  io.Reader
-	MetadataReader io.Reader
+	Result   *TagUpdateResult
+	Content  []byte
+	Metadata []byte
 }
 
 // StaleRevisionError reports that the document moved under the caller.
@@ -126,8 +96,15 @@ func TagNames(tags []archive.Tag) []string {
 	return names
 }
 
-// PlanTagUpdate enforces the stale-revision precondition, applies op, and
-// prepares the blobs to upload. It reports a no-op rather than writing one.
+// PlanTagUpdate enforces the stale-revision precondition, applies op to the
+// document's .content and .metadata bytes, and prepares the blobs to upload.
+// It reports a no-op rather than writing one.
+//
+// The inputs are the raw blobs as stored, not the parsed archive.Content and
+// archive.MetadataFile: those structs model only part of what the device
+// writes, so serialising them back over an existing document would drop every
+// key they do not know. The write here replaces one member of each file and
+// leaves every other byte as it was.
 //
 // The precondition must be evaluated wherever this is called from inside a
 // Sync operation closure: Sync re-runs its closure against a freshly mirrored
@@ -136,10 +113,8 @@ func TagNames(tags []archive.Tag) []string {
 //
 // An empty expectedRevision skips the check, for callers that genuinely intend
 // a blind write.
-func PlanTagUpdate(doc *BlobDoc, op TagOp, names []string, expectedRevision string, now int64) (*TagUpdatePlan, error) {
+func PlanTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names []string, expectedRevision string, now int64) (*TagUpdatePlan, error) {
 	before := doc.Hash
-	beforeTags := TagNames(doc.Content.DocumentTags)
-
 	if expectedRevision != "" && expectedRevision != before {
 		return nil, &StaleRevisionError{
 			DocumentID: doc.DocumentID,
@@ -148,25 +123,34 @@ func PlanTagUpdate(doc *BlobDoc, op TagOp, names []string, expectedRevision stri
 		}
 	}
 
+	content, err := ReplaceContentTags(rawContent, op, names, now)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.ContentExt), err)
+	}
+
 	result := &TagUpdateResult{
 		DocumentID:     doc.DocumentID,
 		Operation:      op.String(),
 		BeforeRevision: before,
 		AfterRevision:  before,
-		BeforeTags:     beforeTags,
-		AfterTags:      beforeTags,
-		PageTagCount:   len(doc.Content.PageTags),
+		BeforeTags:     content.BeforeTags,
+		AfterTags:      content.AfterTags,
+		PageTagCount:   content.PageTagCount,
 	}
-
-	if !doc.ApplyDocumentTags(op, names, now) {
+	if !content.Changed {
 		return &TagUpdatePlan{Result: result}, nil
 	}
 
-	contentHash, contentReader, err := doc.ContentHashAndReader()
+	metadata, err := BumpMetadataLastModified(rawMetadata, now)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.MetadataExt), err)
+	}
+
+	contentHash, err := doc.setFileBlob(archive.ContentExt, content.Bytes)
 	if err != nil {
 		return nil, err
 	}
-	metadataHash, metadataReader, err := doc.MetadataHashAndReader()
+	metadataHash, err := doc.setFileBlob(archive.MetadataExt, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -176,45 +160,316 @@ func PlanTagUpdate(doc *BlobDoc, op TagOp, names []string, expectedRevision stri
 
 	result.Changed = true
 	result.AfterRevision = doc.Hash
-	result.AfterTags = TagNames(doc.Content.DocumentTags)
-	result.PageTagCount = len(doc.Content.PageTags)
 	result.ContentHash = contentHash
 	result.MetadataHash = metadataHash
 
 	return &TagUpdatePlan{
-		Result:         result,
-		ContentReader:  contentReader,
-		MetadataReader: metadataReader,
+		Result:   result,
+		Content:  content.Bytes,
+		Metadata: metadata,
 	}, nil
 }
 
-// VerifyTagWritePayload re-reads a serialised .content blob and checks it says
-// what the caller meant. This is the readback: the in-memory struct being right
-// is not evidence that the bytes on the wire are, and a tag write that silently
-// dropped page tags would be unrecoverable ink loss.
-func VerifyTagWritePayload(payload []byte, wantTags []string, wantPageTags int) error {
-	var readBack archive.Content
-	if err := json.Unmarshal(payload, &readBack); err != nil {
-		return fmt.Errorf("readback: content blob does not parse: %w", err)
-	}
-	got := TagNames(readBack.DocumentTags)
-	if len(got) != len(wantTags) {
-		return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
-	}
-	for i := range got {
-		if got[i] != wantTags[i] {
-			return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
+// setFileBlob points the document's entry for the file with extension ext at
+// blob, and returns the blob's hash.
+func (d *BlobDoc) setFileBlob(ext archive.RmExt, blob []byte) (string, error) {
+	sum := sha256.Sum256(blob)
+	hash := hex.EncodeToString(sum[:])
+	for _, f := range d.Files {
+		if strings.HasSuffix(f.DocumentID, "."+string(ext)) {
+			f.Hash = hash
+			f.Size = int64(len(blob))
+			return hash, nil
 		}
 	}
-	if len(readBack.PageTags) != wantPageTags {
-		return fmt.Errorf(
-			"readback: content blob has %d page tags, expected %d to be preserved",
-			len(readBack.PageTags), wantPageTags)
+	return "", fmt.Errorf("document %s has no %s entry", d.DocumentID, ext)
+}
+
+// ContentTagsReplacement is the outcome of ReplaceContentTags.
+type ContentTagsReplacement struct {
+	Bytes        []byte
+	BeforeTags   []string
+	AfterTags    []string
+	PageTagCount int
+	Changed      bool
+}
+
+// ReplaceContentTags applies op to the top-level "tags" member of a .content
+// blob and returns the new blob. Every byte outside that member is unchanged,
+// and tags that survive the operation keep their original bytes, timestamps
+// included. When op changes nothing, Bytes is raw itself and Changed is false.
+//
+// The document is treated as an opaque JSON object: keys this version of rmapi
+// has never heard of survive because they are never parsed into a struct.
+func ReplaceContentTags(raw []byte, op TagOp, names []string, now int64) (*ContentTagsReplacement, error) {
+	if !json.Valid(raw) {
+		return nil, errors.New("content blob is not valid JSON")
+	}
+
+	elements, err := jsonArrayMember(raw, "tags")
+	if err != nil {
+		return nil, fmt.Errorf("tags: %w", err)
+	}
+	existing := make([]archive.Tag, 0, len(elements))
+	original := make(map[string]json.RawMessage, len(elements))
+	for _, e := range elements {
+		var t archive.Tag
+		if err := json.Unmarshal(e, &t); err != nil {
+			return nil, fmt.Errorf("tags: element does not parse as a tag: %w", err)
+		}
+		existing = append(existing, t)
+		if _, dup := original[t.Name]; !dup {
+			original[t.Name] = e
+		}
+	}
+
+	pageTags, err := jsonArrayMember(raw, "pageTags")
+	if err != nil {
+		return nil, fmt.Errorf("pageTags: %w", err)
+	}
+
+	updated, changed := ApplyTags(existing, op, names, now)
+	out := &ContentTagsReplacement{
+		Bytes:        raw,
+		BeforeTags:   TagNames(existing),
+		AfterTags:    TagNames(updated),
+		PageTagCount: len(pageTags),
+		Changed:      changed,
+	}
+	if !changed {
+		return out, nil
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, t := range updated {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if prior, ok := original[t.Name]; ok && prior != nil {
+			buf.Write(prior)
+			continue
+		}
+		enc, err := json.Marshal(t)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(enc)
+	}
+	buf.WriteByte(']')
+
+	out.Bytes, err = spliceJSONMember(raw, "tags", buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// BumpMetadataLastModified returns the .metadata blob with only its top-level
+// "lastModified" member set to now (as the device stores it: a decimal string
+// of milliseconds). Every other byte is unchanged.
+func BumpMetadataLastModified(raw []byte, now int64) ([]byte, error) {
+	if !json.Valid(raw) {
+		return nil, errors.New("metadata blob is not valid JSON")
+	}
+	value, err := json.Marshal(strconv.FormatInt(now, 10))
+	if err != nil {
+		return nil, err
+	}
+	return spliceJSONMember(raw, "lastModified", value)
+}
+
+// VerifyTagSplice is the readback for a prepared .content blob: it checks,
+// independently of the offsets the splice computed, that spliced differs from
+// original in nothing but the "tags" member and that the member says what the
+// caller meant. It exists so a bug in the splice cannot reach the wire.
+func VerifyTagSplice(original, spliced []byte, wantTags []string) error {
+	var before, after map[string]json.RawMessage
+	if err := json.Unmarshal(original, &before); err != nil {
+		return fmt.Errorf("readback: original content blob does not parse: %w", err)
+	}
+	if err := json.Unmarshal(spliced, &after); err != nil {
+		return fmt.Errorf("readback: spliced content blob does not parse: %w", err)
+	}
+
+	var tags []archive.Tag
+	if err := json.Unmarshal(after["tags"], &tags); err != nil {
+		return fmt.Errorf("readback: spliced tags do not parse: %w", err)
+	}
+	if got := TagNames(tags); !stringsEqual(got, wantTags) {
+		return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
+	}
+
+	delete(before, "tags")
+	delete(after, "tags")
+	if len(before) != len(after) {
+		return fmt.Errorf("readback: content blob has %d members outside tags, original had %d", len(after), len(before))
+	}
+	for k, v := range before {
+		w, ok := after[k]
+		if !ok {
+			return fmt.Errorf("readback: content blob lost member %q", k)
+		}
+		if !bytes.Equal(v, w) {
+			return fmt.Errorf("readback: content blob changed member %q", k)
+		}
 	}
 	return nil
 }
 
-// TagOp selects how a tag write combines with a document's existing tags.
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonArrayMember returns the elements of the top-level array member key, or
+// nil when the member is absent.
+func jsonArrayMember(raw []byte, key string) ([]json.RawMessage, error) {
+	span, err := jsonMemberSpan(raw, key)
+	if err != nil {
+		return nil, err
+	}
+	if !span.found {
+		return nil, nil
+	}
+	var elements []json.RawMessage
+	if err := json.Unmarshal(raw[span.start:span.end], &elements); err != nil {
+		return nil, fmt.Errorf("member is not an array: %w", err)
+	}
+	return elements, nil
+}
+
+// memberSpan locates one top-level member of a JSON object. When found, the
+// value occupies raw[start:end]. When not found, end is the offset of the
+// object's closing brace and empty reports whether the object has no members.
+type memberSpan struct {
+	start, end int
+	found      bool
+	empty      bool
+}
+
+// jsonMemberSpan walks the top-level members of a JSON object with a token
+// decoder, so nested objects and arrays are skipped whole and never
+// interpreted. It refuses duplicate keys: a document that names the same
+// member twice is ambiguous, and replacing one of them would leave the other
+// to win on the device.
+func jsonMemberSpan(raw []byte, key string) (memberSpan, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return memberSpan{}, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return memberSpan{}, errors.New("blob is not a JSON object")
+	}
+
+	span := memberSpan{}
+	members := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return memberSpan{}, err
+		}
+		if d, ok := tok.(json.Delim); ok && d == '}' {
+			if !span.found {
+				span.end = int(dec.InputOffset()) - 1
+				span.empty = members == 0
+			}
+			return span, nil
+		}
+		name, ok := tok.(string)
+		if !ok {
+			return memberSpan{}, fmt.Errorf("unexpected token %v", tok)
+		}
+		members++
+
+		var value json.RawMessage
+		if name != key {
+			if err := dec.Decode(&value); err != nil {
+				return memberSpan{}, err
+			}
+			continue
+		}
+		if span.found {
+			return memberSpan{}, fmt.Errorf("duplicate member %q", key)
+		}
+		start, err := valueStart(raw, int(dec.InputOffset()))
+		if err != nil {
+			return memberSpan{}, err
+		}
+		if err := dec.Decode(&value); err != nil {
+			return memberSpan{}, err
+		}
+		end := start + len(bytes.TrimLeft(raw[start:int(dec.InputOffset())], " \t\r\n"))
+		span = memberSpan{start: start, end: end, found: true}
+		if !bytes.Equal(bytes.TrimSpace(raw[start:end]), bytes.TrimSpace(value)) {
+			return memberSpan{}, fmt.Errorf("member %q: span does not match decoded value", key)
+		}
+	}
+}
+
+// valueStart skips the ':' and surrounding whitespace that follow a member
+// name ending at offset, and returns the offset where the value begins.
+func valueStart(raw []byte, offset int) (int, error) {
+	i := offset
+	for i < len(raw) && isJSONSpace(raw[i]) {
+		i++
+	}
+	if i >= len(raw) || raw[i] != ':' {
+		return 0, errors.New("malformed member: expected ':'")
+	}
+	i++
+	for i < len(raw) && isJSONSpace(raw[i]) {
+		i++
+	}
+	return i, nil
+}
+
+func isJSONSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n'
+}
+
+// spliceJSONMember returns raw with the top-level member key set to value and
+// every other byte unchanged. An absent member is appended as the last one.
+func spliceJSONMember(raw []byte, key string, value []byte) ([]byte, error) {
+	span, err := jsonMemberSpan(raw, key)
+	if err != nil {
+		return nil, err
+	}
+	name, err := json.Marshal(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(raw) + len(value) + len(name) + 3)
+	if span.found {
+		out.Write(raw[:span.start])
+		out.Write(value)
+		out.Write(raw[span.end:])
+	} else {
+		out.Write(raw[:span.end])
+		if !span.empty {
+			out.WriteByte(',')
+		}
+		out.Write(name)
+		out.WriteByte(':')
+		out.Write(value)
+		out.Write(raw[span.end:])
+	}
+	if !json.Valid(out.Bytes()) {
+		return nil, fmt.Errorf("splice of %q produced invalid JSON", key)
+	}
+	return out.Bytes(), nil
+}
+
 type TagOp int
 
 const (
@@ -302,52 +557,6 @@ func tagsEqual(a, b []archive.Tag) bool {
 		}
 	}
 	return true
-}
-
-// ApplyDocumentTags applies op to the document's tags in place and reports
-// whether anything changed. PageTags and the page .rm payloads are never
-// touched. When nothing changes, LastModified is deliberately left alone so a
-// no-op write does not alter the document.
-func (d *BlobDoc) ApplyDocumentTags(op TagOp, names []string, now int64) bool {
-	updated, changed := ApplyTags(d.Content.DocumentTags, op, names, now)
-	if !changed {
-		return false
-	}
-	d.Content.DocumentTags = updated
-	if d.Content.PageTags == nil {
-		d.Content.PageTags = []archive.PageTag{}
-	}
-	d.Metadata.LastModified = strconv.FormatInt(now, 10)
-	d.Metadata.MetadataModified = true
-	return true
-}
-
-func (d *BlobDoc) SetDocumentTags(tags []string) {
-	now := time.Now().UnixMilli()
-	docTags := make([]archive.Tag, len(tags))
-	for i, t := range tags {
-		docTags[i] = archive.Tag{
-			Name:      t,
-			Timestamp: now,
-		}
-	}
-	d.Content.DocumentTags = docTags
-	if d.Content.PageTags == nil {
-		d.Content.PageTags = []archive.PageTag{}
-	}
-	d.Metadata.LastModified = strconv.FormatInt(now, 10)
-	d.Metadata.MetadataModified = true
-}
-
-func (d *BlobDoc) UpdateDocumentTags(tags []string) error {
-	d.SetDocumentTags(tags)
-	if _, _, err := d.ContentHashAndReader(); err != nil {
-		return err
-	}
-	if _, _, err := d.MetadataHashAndReader(); err != nil {
-		return err
-	}
-	return d.Rehash()
 }
 
 func (d *BlobDoc) MetadataHashAndReader() (hash string, reader io.Reader, err error) {

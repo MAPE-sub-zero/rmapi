@@ -8,6 +8,7 @@ import (
 
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/api/sync15"
+	"github.com/ogier/pflag"
 )
 
 // ParseTags parses a comma-separated tag string into a slice of non-empty trimmed tag names.
@@ -32,48 +33,44 @@ type settagArgs struct {
 	Tags             []string
 	Path             string
 	ExpectedRevision string
-	JSON             bool
 }
 
-// parseSettagArgs parses settag's flags and positional arguments. It does not
-// touch the filesystem or the API, so it can be unit-tested without a shell.
-func parseSettagArgs(args []string) (*settagArgs, error) {
-	opSet := false
+// settagFlags holds the raw flag values parsed by newSettagFlagSet.
+type settagFlags struct {
+	add, remove, replace bool
+	ifRevision           string
+}
+
+func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
+	f := &settagFlags{}
+	fs := pflag.NewFlagSet("settag", pflag.ContinueOnError)
+	fs.BoolVar(&f.add, "add", false, "add the supplied tags, leaving existing ones in place")
+	fs.BoolVar(&f.remove, "remove", false, "remove the supplied tags, leaving the rest in place")
+	fs.BoolVar(&f.replace, "replace", false, "make the document's tags exactly the supplied set (default)")
+	fs.StringVar(&f.ifRevision, "if-revision", "", "only write if the document is currently at this revision hash")
+	return fs, f
+}
+
+// resolveSettagArgs validates the parsed flags and positional arguments. It
+// does not touch the filesystem or the API, so it can be unit-tested without
+// a shell.
+func resolveSettagArgs(f *settagFlags, positional []string) (*settagArgs, error) {
+	opCount := 0
 	op := sync15.TagOpReplace
-	expectedRevision := ""
-	jsonOut := false
-
-	positional := make([]string, 0, len(args))
-
-	i := 0
-	for i < len(args) {
-		arg := args[i]
-		switch arg {
-		case "--add", "--remove", "--replace":
-			if opSet {
-				return nil, errors.New("choose one of --add, --remove, --replace")
-			}
-			opSet = true
-			switch arg {
-			case "--add":
-				op = sync15.TagOpAdd
-			case "--remove":
-				op = sync15.TagOpRemove
-			case "--replace":
-				op = sync15.TagOpReplace
-			}
-		case "--if-revision":
-			if i+1 >= len(args) {
-				return nil, errors.New("--if-revision needs a revision")
-			}
-			i++
-			expectedRevision = args[i]
-		case "--json":
-			jsonOut = true
-		default:
-			positional = append(positional, arg)
-		}
-		i++
+	if f.add {
+		opCount++
+		op = sync15.TagOpAdd
+	}
+	if f.remove {
+		opCount++
+		op = sync15.TagOpRemove
+	}
+	if f.replace {
+		opCount++
+		op = sync15.TagOpReplace
+	}
+	if opCount > 1 {
+		return nil, errors.New("choose one of --add, --remove, --replace")
 	}
 
 	if len(positional) < 2 {
@@ -87,24 +84,25 @@ func parseSettagArgs(args []string) (*settagArgs, error) {
 		Op:               op,
 		Tags:             ParseTags(tagsStr),
 		Path:             path,
-		ExpectedRevision: expectedRevision,
-		JSON:             jsonOut,
+		ExpectedRevision: f.ifRevision,
 	}, nil
 }
 
+// parseSettagArgs parses settag's flags and positional arguments. It is the
+// test seam: it builds the flag set, parses args, then delegates to
+// resolveSettagArgs.
+func parseSettagArgs(args []string) (*settagArgs, error) {
+	fs, f := newSettagFlagSet()
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	return resolveSettagArgs(f, fs.Args())
+}
+
 func settagCmd(ctx *ShellCtxt) *ishell.Cmd {
-	longHelp := `Usage: settag [--add|--remove|--replace] [--if-revision <hash>] [--json] <path> <tag1,tag2...>
+	longHelp := `Usage: settag [--add|--remove|--replace] [--if-revision=<hash>] <path> <tag1,tag2...>
 
-  --replace          Make the document's tags exactly the supplied set (default).
-  --add              Add the supplied tags, leaving existing ones in place.
-  --remove           Remove the supplied tags, leaving the rest in place.
-  --if-revision <hash>
-                     Only apply the write if the document is currently at this
-                     revision hash; otherwise fail rather than overwrite a
-                     concurrent change.
-  --json             Print the result as indented JSON instead of a summary.
-
-rmapi is licensed under AGPL-3.0.`
+Tags are comma-separated. With no operation flag the document's tags are replaced.`
 
 	return &ishell.Cmd{
 		Name:      "settag",
@@ -112,17 +110,18 @@ rmapi is licensed under AGPL-3.0.`
 		Completer: createEntryCompleter(ctx),
 		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
-			if checkHelp(longHelp, c.Args, c) {
+			flagSet, flags := newSettagFlagSet()
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
 				return
 			}
 
-			settagArgs, err := parseSettagArgs(c.Args)
+			args, err := resolveSettagArgs(flags, flagSet.Args())
 			if err != nil {
 				c.Err(err)
 				return
 			}
 
-			node, err := ctx.api.Filetree().NodeByPath(settagArgs.Path, ctx.node)
+			node, err := ctx.api.Filetree().NodeByPath(args.Path, ctx.node)
 			if err != nil {
 				c.Err(errors.New("file doesn't exist"))
 				return
@@ -133,8 +132,8 @@ rmapi is licensed under AGPL-3.0.`
 				return
 			}
 
-			result, err := ctx.api.UpdateDocumentTagsWithOptions(
-				node.Document.ID, settagArgs.Op, settagArgs.Tags, settagArgs.ExpectedRevision)
+			result, err := ctx.api.UpdateDocumentTags(
+				node.Document.ID, args.Op, args.Tags, args.ExpectedRevision)
 			if err != nil {
 				c.Err(fmt.Errorf("failed to set tags: %w", err))
 				return
@@ -142,7 +141,7 @@ rmapi is licensed under AGPL-3.0.`
 
 			node.Document.Tags = result.AfterTags
 
-			if settagArgs.JSON {
+			if ctx.JSONOutput {
 				out, err := json.MarshalIndent(result, "", "  ")
 				if err != nil {
 					c.Err(fmt.Errorf("failed to marshal result: %w", err))
@@ -150,9 +149,9 @@ rmapi is licensed under AGPL-3.0.`
 				}
 				c.Println(string(out))
 			} else if !result.Changed {
-				c.Printf("unchanged: %s already has tags [%s]\n", settagArgs.Path, strings.Join(result.AfterTags, ", "))
+				c.Printf("unchanged: %s already has tags [%s]\n", args.Path, strings.Join(result.AfterTags, ", "))
 			} else {
-				c.Printf("%s: %s\n", result.Operation, settagArgs.Path)
+				c.Printf("%s: %s\n", result.Operation, args.Path)
 				c.Printf("  tags: [%s] -> [%s]\n", strings.Join(result.BeforeTags, ", "), strings.Join(result.AfterTags, ", "))
 				c.Printf("  revision: %s -> %s\n", result.BeforeRevision, result.AfterRevision)
 				c.Printf("  page tags preserved: %d\n", result.PageTagCount)

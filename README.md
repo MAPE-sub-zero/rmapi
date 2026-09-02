@@ -81,6 +81,7 @@ docker run -v $HOME/.config/rmapi/:/home/app/.config/rmapi/ rmapi help
 - [x] autocomplete
 - [x] globbing
 - [x] upload a directory and all its files and subdirectories recursively
+- [x] set document tags
 
 # Commands
 
@@ -283,6 +284,17 @@ Use `mv source destination` to move or rename a file or directory.
 ## Stat a directory or file
 
 Use `stat entry` to dump its metadata as reported by the Cloud API.
+
+## Setting tags
+
+Use `settag path tag1,tag2` to set a document's tags. `--add` and `--remove` change only the named tags; without a flag the tag set is replaced. `--if-revision=<hash>` refuses the write if the document has changed since you read that hash. The global `--json` flag prints the before/after result as JSON.
+
+```
+settag notes/todo inbox,urgent
+settag --add notes/todo reviewed
+settag --remove notes/todo inbox
+rmapi --json settag --if-revision=<hash> notes/todo inbox
+```
 
 # Run command non-interactively
 

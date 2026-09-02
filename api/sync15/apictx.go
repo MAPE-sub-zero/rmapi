@@ -2,8 +2,8 @@ package sync15
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -467,74 +467,72 @@ func (ctx *ApiCtx) ReplaceDocumentFile(docId, sourceDocPath string, notify bool)
 	}, notify)
 }
 
-// UpdateDocumentTagsWithOptions applies a tag operation with a stale-revision
-// precondition, verifies the payload before it is uploaded, and returns a
-// structured before/after report.
+// errTagWriteNoop aborts a Sync closure whose tag operation turned out to
+// change nothing once the tree was current. Sync always rewrites the root
+// index after a successful closure, which would bump the generation for a
+// write that wrote nothing; returning an error leaves the remote untouched.
+var errTagWriteNoop = errors.New("tags already as requested")
+
+// UpdateDocumentTags applies a tag operation to one document with a
+// stale-revision precondition, and returns a structured before/after report.
 //
-// Three things here are deliberate:
+// The document's .content and .metadata blobs are fetched by hash inside the
+// operation closure and edited as opaque bytes (see PlanTagUpdate): the hash
+// tree's parsed copies are partial models and are never serialised back.
+// Fetching by hash also means the bytes edited are exactly the bytes the
+// current tree references, however stale the parsed copies are.
 //
-//   - The no-op is decided before Sync is entered. Sync always rewrites the
-//     root index, so calling it for a write that changes nothing would bump the
-//     generation for no reason and make a retry indistinguishable from an edit.
-//   - The precondition is re-checked inside the operation closure. Sync re-runs
-//     that closure against a freshly mirrored tree when the remote generation
-//     moved, which is exactly the concurrent change the precondition exists to
-//     refuse; checking only once, outside, would let it through on the retry.
-//   - The generation is compared across the call. Sync gives up after ten
-//     attempts by breaking out of its loop and returning saveTree's error,
-//     which is nil, so a caller that trusts its return value can believe a
-//     write landed when the root index was never written. An unchanged
-//     generation means nothing was committed, and that is treated as failure.
-func (ctx *ApiCtx) UpdateDocumentTagsWithOptions(docId string, op TagOp, tags []string, expectedRevision string) (*TagUpdateResult, error) {
-	doc, err := ctx.hashTree.FindDoc(docId)
-	if err != nil {
+// The precondition is checked inside the closure. Sync re-runs its closure
+// against a freshly mirrored tree when the remote generation moved, which is
+// exactly the concurrent change the precondition exists to refuse; a check
+// made once outside would let it through on the retry.
+//
+// Sync's own return value cannot be trusted for "did it land": it gives up
+// after ten generation conflicts by breaking out of its loop and returning
+// nil, with the tree re-mirrored from the remote. So after Sync the document
+// is looked up again in the tree and its .content and .metadata entries must
+// carry the hashes this write produced — after a gave-up Sync they carry the
+// remote's — and both blobs are read back through the transport and compared
+// byte for byte with what was sent. A concurrent writer landing between Sync
+// and that readback is reported as a mismatch rather than hidden.
+func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, expectedRevision string) (*TagUpdateResult, error) {
+	if _, err := ctx.hashTree.FindDoc(docId); err != nil {
 		return nil, err
 	}
-	if expectedRevision != "" && expectedRevision != doc.Hash {
-		return nil, &StaleRevisionError{
-			DocumentID: docId,
-			Expected:   expectedRevision,
-			Actual:     doc.Hash,
-		}
-	}
-	if _, changed := ApplyTags(doc.Content.DocumentTags, op, tags, time.Now().UnixMilli()); !changed {
-		names := TagNames(doc.Content.DocumentTags)
-		log.Info.Println("tags already as requested; nothing to write")
-		return &TagUpdateResult{
-			DocumentID:     docId,
-			Operation:      op.String(),
-			Changed:        false,
-			BeforeRevision: doc.Hash,
-			AfterRevision:  doc.Hash,
-			BeforeTags:     names,
-			AfterTags:      names,
-			PageTagCount:   len(doc.Content.PageTags),
-		}, nil
-	}
 
-	generationBefore := ctx.hashTree.Generation
 	var result *TagUpdateResult
+	var plan *TagUpdatePlan
 
-	err = Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
+	err := Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
 		d, err := t.FindDoc(docId)
 		if err != nil {
 			return err
 		}
+		// Entry.Type is the index column ("0" / "80000000"), not the kind of
+		// node; the kind lives in .metadata, as ToDocument reads it.
+		if d.Metadata.CollectionType != model.DocumentType {
+			return fmt.Errorf("%s is a %q, not a document", docId, d.Metadata.CollectionType)
+		}
 
-		plan, err := PlanTagUpdate(d, op, tags, expectedRevision, time.Now().UnixMilli())
+		rawContent, err := ctx.fetchDocFile(d, archive.ContentExt)
+		if err != nil {
+			return err
+		}
+		rawMetadata, err := ctx.fetchDocFile(d, archive.MetadataExt)
+		if err != nil {
+			return err
+		}
+
+		plan, err = PlanTagUpdate(d, rawContent, rawMetadata, op, tags, expectedRevision, time.Now().UnixMilli())
 		if err != nil {
 			return err
 		}
 		result = plan.Result
 		if !plan.Result.Changed {
-			return nil
+			return errTagWriteNoop
 		}
 
-		payload, err := json.Marshal(d.Content)
-		if err != nil {
-			return err
-		}
-		if err := VerifyTagWritePayload(payload, plan.Result.AfterTags, plan.Result.PageTagCount); err != nil {
+		if err := VerifyTagSplice(rawContent, plan.Content, plan.Result.AfterTags); err != nil {
 			return err
 		}
 
@@ -542,10 +540,10 @@ func (ctx *ApiCtx) UpdateDocumentTagsWithOptions(docId string, op TagOp, tags []
 			return err
 		}
 
-		if err := ctx.blobStorage.UploadBlob(plan.Result.ContentHash, addExt(d.DocumentID, archive.ContentExt), plan.ContentReader); err != nil {
+		if err := ctx.blobStorage.UploadBlob(plan.Result.ContentHash, addExt(d.DocumentID, archive.ContentExt), bytes.NewReader(plan.Content)); err != nil {
 			return err
 		}
-		if err := ctx.blobStorage.UploadBlob(plan.Result.MetadataHash, addExt(d.DocumentID, archive.MetadataExt), plan.MetadataReader); err != nil {
+		if err := ctx.blobStorage.UploadBlob(plan.Result.MetadataHash, addExt(d.DocumentID, archive.MetadataExt), bytes.NewReader(plan.Metadata)); err != nil {
 			return err
 		}
 
@@ -555,64 +553,73 @@ func (ctx *ApiCtx) UpdateDocumentTagsWithOptions(docId string, op TagOp, tags []
 		}
 		return ctx.blobStorage.UploadBlob(d.Hash, addExt(d.DocumentID, archive.DocSchemaExt), indexReader)
 	}, true)
+	if errors.Is(err, errTagWriteNoop) {
+		log.Info.Println("tags already as requested; nothing to write")
+		return result, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if result == nil {
+	if result == nil || plan == nil {
 		return nil, errors.New("tag update did not run")
 	}
-	if result.Changed && ctx.hashTree.Generation == generationBefore {
-		return nil, fmt.Errorf(
-			"tag write for %s was not committed: root generation is still %d. "+
-				"The document was not changed remotely",
-			docId, generationBefore)
+
+	if err := ctx.verifyTagWriteLanded(docId, plan); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
 
-// UpdateDocumentTags updates document-level tags for a given docId
-func (ctx *ApiCtx) UpdateDocumentTags(docId string, tags []string) error {
-	return Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
-		doc, err := t.FindDoc(docId)
+// fetchDocFile reads one of a document's files, by the hash its entry carries.
+func (ctx *ApiCtx) fetchDocFile(d *BlobDoc, ext archive.RmExt) ([]byte, error) {
+	name := addExt(d.DocumentID, ext)
+	for _, f := range d.Files {
+		if f.DocumentID != name {
+			continue
+		}
+		r, err := ctx.blobStorage.GetReader(f.Hash, f.DocumentID)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("fetch %s: %w", name, err)
 		}
-
-		doc.SetDocumentTags(tags)
-
-		contentHash, contentReader, err := doc.ContentHashAndReader()
+		defer r.Close()
+		raw, err := io.ReadAll(r)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("read %s: %w", name, err)
 		}
+		return raw, nil
+	}
+	return nil, fmt.Errorf("document %s has no %s file", d.DocumentID, name)
+}
 
-		metaHash, metaReader, err := doc.MetadataHashAndReader()
+// verifyTagWriteLanded is the post-write readback described on
+// UpdateDocumentTags.
+func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *TagUpdatePlan) error {
+	d, err := ctx.hashTree.FindDoc(docId)
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
+	}
+	if d.Hash != plan.Result.AfterRevision {
+		return fmt.Errorf(
+			"tag write for %s was not committed: document is at revision %s, this write produced %s",
+			docId, d.Hash, plan.Result.AfterRevision)
+	}
+	for _, want := range []struct {
+		ext  archive.RmExt
+		hash string
+		sent []byte
+	}{
+		{archive.ContentExt, plan.Result.ContentHash, plan.Content},
+		{archive.MetadataExt, plan.Result.MetadataHash, plan.Metadata},
+	} {
+		got, err := ctx.fetchDocFile(d, want.ext)
 		if err != nil {
-			return err
+			return fmt.Errorf("readback: %w", err)
 		}
-
-		if err := doc.Rehash(); err != nil {
-			return err
+		if !bytes.Equal(got, want.sent) {
+			return fmt.Errorf("readback: remote %s differs from what this write sent", addExt(docId, want.ext))
 		}
-
-		if err := t.Rehash(); err != nil {
-			return err
-		}
-
-		if err := ctx.blobStorage.UploadBlob(contentHash, addExt(doc.DocumentID, archive.ContentExt), contentReader); err != nil {
-			return err
-		}
-
-		if err := ctx.blobStorage.UploadBlob(metaHash, addExt(doc.DocumentID, archive.MetadataExt), metaReader); err != nil {
-			return err
-		}
-
-		log.Info.Println("Uploading new doc index...", doc.Hash)
-		indexReader, err := doc.IndexReader()
-		if err != nil {
-			return err
-		}
-		return ctx.blobStorage.UploadBlob(doc.Hash, addExt(doc.DocumentID, archive.DocSchemaExt), indexReader)
-	}, true)
+	}
+	return nil
 }
 
 // DocumentsFileTree reads your remote documents and builds a file tree
