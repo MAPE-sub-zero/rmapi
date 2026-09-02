@@ -208,10 +208,14 @@ func settagCmd(ctx *ShellCtxt) *ishell.Cmd {
 
 Tags are comma-separated; a tag name cannot itself contain a comma (there is
 no escape for it). With no operation flag the document's tags are replaced.
-An empty tag list is refused outright -- use --remove <tag,...> to drop
-specific tags instead of clearing all of them. --show prints the document's
-current revision (the value to pass to a later --if-revision) and its tags,
-and cannot be combined with --add, --remove, or --if-revision.`
+An empty tag list is refused outright for every operation -- --add/--remove
+with nothing named is a usage error too, not just replace; use --remove
+<tag,...> to drop specific tags instead of clearing all of them. A tag or
+path starting with - needs -- before the positional arguments, e.g.
+settag -- notes/-todo -urgent. --show prints the document's current revision
+(the value to pass to a later --if-revision) and its tags, as of this
+shell's last refresh -- a fresh "rmapi settag --show" process is always
+current -- and cannot be combined with --add, --remove, or --if-revision.`
 
 	return &ishell.Cmd{
 		Name:      "settag",

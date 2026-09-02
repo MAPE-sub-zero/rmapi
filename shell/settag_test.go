@@ -531,6 +531,46 @@ func TestSettagCommandErrorJSONClassifiesSupersededAndNotCommittedAndKeepsTheRes
 	}
 }
 
+// --- Round 5, item P/M: a doc deleted after commit omits actualRevision ----
+
+func TestSettagCommandErrorJSONSupersededByDeletionOmitsActualRevision(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.err = &sync15.SupersededError{DocumentID: "doc-uuid-123", ExpectedRevision: "mine", ActualRevision: ""}
+	mock.result = &sync15.TagUpdateResult{DocumentID: "doc-uuid-123", AfterRevision: "mine"}
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+	})
+	require.Error(t, runErr)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(out), &got), "stdout must be one JSON object: %s", out)
+	assert.Equal(t, "superseded", got["kind"])
+	_, present := got["actualRevision"]
+	assert.False(t, present, "actualRevision must be omitted, not printed as an empty string, when the document was deleted")
+	result, ok := got["result"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "mine", result["afterRevision"])
+}
+
+func TestSettagCommandErrorJSONStaleRevisionHasNullResult(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.err = &sync15.StaleRevisionError{DocumentID: "doc-uuid-123", Expected: "rev-a", Actual: "rev-b"}
+	mock.result = nil // the real ApiCtx never builds a plan before a stale-revision refusal
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+	})
+	require.Error(t, runErr)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(out), &got), "stdout must be one JSON object: %s", out)
+	assert.Equal(t, "stale_revision", got["kind"])
+	assert.Nil(t, got["result"], "stale_revision must report result: null, never a populated plan")
+}
+
 func TestSettagCommandErrorJSONPrintsStructuredErrorObject(t *testing.T) {
 	_, mock, userInfo := newSettagTestFixture()
 	mock.err = &sync15.StaleRevisionError{DocumentID: "doc-uuid-123", Expected: "rev-a", Actual: "rev-b"}

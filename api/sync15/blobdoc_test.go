@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -241,7 +242,11 @@ func TestTagWritePreservesEveryOtherKeyInContentAndMetadata(t *testing.T) {
 				topLevelWithout(t, []byte(preservationMetadata), "lastModified"),
 				topLevelWithout(t, plan.Metadata, "lastModified"),
 				".metadata: a tag write changed something other than lastModified")
-			assert.Equal(t, `"42"`, string(topLevelWithout(t, plan.Metadata, "")["lastModified"]))
+			// Round 5, item R: lastModified never moves backwards.
+			// preservationMetadata's own lastModified ("1700000001000") is
+			// already far ahead of this test's now (42), so the published
+			// stamp must be one past the existing value, not the literal now.
+			assert.Equal(t, `"1700000001001"`, string(topLevelWithout(t, plan.Metadata, "")["lastModified"]))
 		})
 	}
 }
@@ -641,7 +646,7 @@ type fakeCloud struct {
 	alwaysConflict  bool   // root PUTs always 412, regardless of generation
 	failRootPutOnce bool   // the next root PUT returns 500 (a genuine, non-412 failure), then clears itself
 	rootPutAckLost  bool   // the next root PUT lands (state updates) but the response is a 500 anyway
-	afterRootPut    func() // run synchronously after a successful root PUT, lock released
+	afterRootPut    func() // run synchronously after any root PUT that changed state (landed or ack-lost), lock released
 
 	// staleReadsRemaining makes GetRootIndex report staleRootHash/staleGen
 	// (a snapshot a caller supplies, typically the pre-write state) instead
@@ -650,6 +655,17 @@ type fakeCloud struct {
 	staleReadsRemaining int
 	staleRootHash       string
 	staleGen            int64
+
+	// emptyCloudAfterRootPuts, once rootPuts reaches it, makes GetRootIndex
+	// report the empty-cloud shape (Hash="", Generation=0) instead of live
+	// state -- round 5, item J: simulates Mirror observing an empty cloud
+	// partway through a retry storm, independent of the server's real state.
+	emptyCloudAfterRootPuts int
+
+	// totalRequests counts every HTTP request the fake receives, of any
+	// method or path -- round 5, item O: proves a refused call never reaches
+	// the network at all.
+	totalRequests int
 }
 
 func (c *fakeCloud) handler() http.Handler {
@@ -660,6 +676,10 @@ func (c *fakeCloud) handler() http.Handler {
 		if c.staleReadsRemaining > 0 {
 			c.staleReadsRemaining--
 			json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: c.staleRootHash, Generation: c.staleGen, Schema: 4})
+			return
+		}
+		if c.emptyCloudAfterRootPuts > 0 && c.rootPuts >= c.emptyCloudAfterRootPuts {
+			json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: "", Generation: 0, Schema: 4})
 			return
 		}
 		json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen, Schema: 4})
@@ -691,21 +711,24 @@ func (c *fakeCloud) handler() http.Handler {
 		}
 		c.rootHash = req.Hash
 		c.gen++
-		if c.rootPutAckLost {
-			// The write lands (state above is already updated) but the
-			// response never usably reaches the caller.
-			c.rootPutAckLost = false
-			c.mu.Unlock()
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		resp := model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen}
+		newHash, newGen := c.rootHash, c.gen
+		ackLost := c.rootPutAckLost
+		c.rootPutAckLost = false
 		hook := c.afterRootPut
 		c.mu.Unlock()
+		// The hook runs for both outcomes below: state has already changed
+		// server-side either way, so a concurrent writer racing the response
+		// is equally possible whether or not this response itself lands.
 		if hook != nil {
 			hook()
 		}
-		json.NewEncoder(w).Encode(resp)
+		if ackLost {
+			// The write lands (state above is already updated) but the
+			// response never usably reaches the caller.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: newHash, Generation: newGen})
 	})
 	mux.HandleFunc("/sync/v3/files/", func(w http.ResponseWriter, r *http.Request) {
 		hash := strings.TrimPrefix(r.URL.Path, "/sync/v3/files/")
@@ -735,7 +758,12 @@ func (c *fakeCloud) handler() http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.totalRequests++
+		c.mu.Unlock()
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // seedDoc stores a complete document (content, metadata, one ink file, and its
@@ -1590,4 +1618,362 @@ func TestUpdateDocumentTagsPostWriteReadbackMatchesTheServerDocIndex(t *testing.
 	require.NotNil(t, rmAfter, "the published doc index must still list doc-1/pg-1.rm")
 	assert.Equal(t, rmBefore.Hash, rmAfter.Hash)
 	assert.Equal(t, rmBefore.Size, rmAfter.Size)
+}
+
+// --- Round 5, item N: verify bytes against the hashes that named them ------
+//
+// Content addressing proves what a store SHOULD hold under a hash, never that
+// the bytes a GET actually returned are those bytes. Every blob this write
+// reads and edits (.content/.metadata via fetchDocFile, the root index via
+// assertRootContainment and the post-commit readback walk) is now checked
+// against its own hash before being trusted.
+
+func TestFetchDocFileRefusesBytesThatDoNotHashToTheirOwnAddress(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	// A stand-in for a stale/mixed-up CDN object: the bytes stored under the
+	// .content blob's own hash are a different, validly-formed document.
+	const wrongContent = `{"fileType":"notebook","pageCount":1,"pages":["OTHER"],"pageTags":[],"tags":[]}`
+	var contentHash string
+	for _, f := range doc.Files {
+		if f.DocumentID == "doc-1.content" {
+			contentHash = f.Hash
+		}
+	}
+	require.NotEmpty(t, contentHash)
+	cloud.blobs[contentHash] = []byte(wrongContent)
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to splice")
+	assert.Empty(t, cloud.putBlobs, "no upload may happen once the source bytes fail their own hash check")
+}
+
+func TestAssertRootContainmentRefusesATamperedRootBody(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	// The root blob stored under the tree's own hash no longer hashes to that
+	// address -- a corrupted or substituted root index.
+	cloud.blobs[cloud.rootHash] = append(append([]byte{}, cloud.blobs[cloud.rootHash]...), '\n')
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Equal(t, 0, cloud.rootPuts)
+	assert.Empty(t, cloud.putBlobs)
+}
+
+// --- Round 5, item L: containment adopts the server's Size ------------------
+
+func TestAssertRootContainmentAdoptsTheServersSizeForAnUntouchedSibling(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	target := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	sibling := cloud.seedDoc(t, "doc-2", preservationContent, preservationMetadata)
+	cloud.setRoot(t, target, sibling)
+	ctx.mirrorFrom(t)
+
+	// Corrupt the cached Size for the untouched sibling without moving its
+	// hash: the server's root entry, not the corrupted local cache, must win
+	// when the root is republished.
+	d2, err := ctx.hashTree.FindDoc("doc-2")
+	require.NoError(t, err)
+	serverSize := d2.Size
+	d2.Size = serverSize + 12345
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	require.True(t, res.Changed)
+
+	rootReader, err := ctx.blobStorage.GetReader(cloud.rootHash, addExt("root", archive.DocSchemaExt))
+	require.NoError(t, err)
+	defer rootReader.Close()
+	entries, _, err := parseIndex(rootReader)
+	require.NoError(t, err)
+	var doc2Entry *Entry
+	for _, e := range entries {
+		if e.DocumentID == "doc-2" {
+			doc2Entry = e
+		}
+	}
+	require.NotNil(t, doc2Entry)
+	assert.Equal(t, serverSize, doc2Entry.Size, "the republished root must list the server's original size for the untouched sibling, not the corrupted local cache")
+}
+
+// --- Round 5, item J: local commit fact needs the generation conjunct ------
+
+func TestUpdateDocumentTagsIsNotCommittedWhenFailOpenMirrorsAnEmptyCloud(t *testing.T) {
+	// Sync's own 10-conflict fail-open mirrors the tree one last time before
+	// giving up. Mirror's empty-cloud branch (tree.go) never assigns t.Hash,
+	// only Docs/Generation -- so ctx.hashTree.Hash == attemptedRoot can hold
+	// by coincidence with nothing actually committed. The generation
+	// conjunct catches it: a genuinely empty cloud reports Generation 0,
+	// never past plan.generation.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	cloud.alwaysConflict = true
+	cloud.emptyCloudAfterRootPuts = 10 // Sync's own last mirror, after the 10th conflict
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+
+	var notCommitted *NotCommittedError
+	require.True(t, errors.As(err, &notCommitted), "want *NotCommittedError, got %T", err)
+	var superseded *SupersededError
+	assert.False(t, errors.As(err, &superseded))
+	assert.Empty(t, notCommitted.ActualRevision, "the empty-cloud mirror left the local tree with no doc-1 entry at all")
+
+	_, ferr := ctx.hashTree.FindDoc("doc-1")
+	assert.Error(t, ferr, "no tags may be reported as written when the write never committed")
+}
+
+func TestUpdateDocumentTagsReadbackAtOwnCommittedGenerationIsStillLagNotSupersessionAfterTheGenerationConjunct(t *testing.T) {
+	// Round 5 regression guard for item J: a genuine Sync success must still
+	// satisfy the new Generation > plan.generation conjunct on the very next
+	// call, so the existing lag-vs-supersession classification is untouched.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	origDelays := readbackRetryDelays
+	readbackRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { readbackRetryDelays = origDelays })
+
+	cloud.afterRootPut = func() {
+		cloud.mu.Lock()
+		cloud.staleRootHash, cloud.staleGen = rootBefore, genBefore+1
+		cloud.staleReadsRemaining = 2
+		cloud.mu.Unlock()
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	assert.True(t, res.Changed)
+}
+
+// --- Round 5, item K: post-error readback follows the doc entry ------------
+
+func TestUpdateDocumentTagsAckLostPlusUnrelatedRootMoveSucceeds(t *testing.T) {
+	// The inversion of the reviewer's TestAdvE2ELostAckPlusUnrelatedRootMoveIsReportedAsFailure:
+	// the root PUT lands, its ack is lost, and a third writer adds an
+	// unrelated document before the post-error readback runs. doc-1 on the
+	// server still carries exactly the revision this write produced, so this
+	// must be reported as success with no rollback.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc1 := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	doc2 := cloud.seedDoc(t, "doc-2", `{}`, `{"type":"CollectionType","visibleName":"F","parent":"","lastModified":"1"}`)
+	cloud.setRoot(t, doc1, doc2)
+	ctx.mirrorFrom(t)
+
+	cloud.rootPutAckLost = true
+	doc3 := cloud.seedDoc(t, "doc-3", `{}`, `{"type":"CollectionType","visibleName":"G","parent":"","lastModified":"1"}`)
+	cloud.afterRootPut = func() {
+		d1, err := ctx.hashTree.FindDoc("doc-1")
+		require.NoError(t, err)
+		d2, err := ctx.hashTree.FindDoc("doc-2")
+		require.NoError(t, err)
+		cloud.setRoot(t, d1, d2, doc3)
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err, "the write is on the server; an unrelated root move before the readback must not be reported as failure")
+	require.True(t, res.Changed)
+
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, res.AfterRevision, d.Hash, "local tree must keep the tags this write applied, not roll back")
+}
+
+func TestUpdateDocumentTagsAckLostPlusStaleReadsOfThePreWriteRootSucceeds(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	origDelays := readbackRetryDelays
+	readbackRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { readbackRetryDelays = origDelays })
+
+	cloud.rootPutAckLost = true
+	cloud.afterRootPut = func() {
+		cloud.mu.Lock()
+		cloud.staleRootHash, cloud.staleGen = rootBefore, genBefore
+		cloud.staleReadsRemaining = 2
+		cloud.mu.Unlock()
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	assert.True(t, res.Changed)
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, res.AfterRevision, d.Hash)
+}
+
+// --- Round 5, item P: a doc deleted after our commit is supersession -------
+
+func TestUpdateDocumentTagsReportsSupersededWhenDocDeletedAfterCommit(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	other := cloud.seedDoc(t, "doc-2", `{}`, `{"type":"CollectionType","visibleName":"F","parent":"","lastModified":"1"}`)
+	cloud.setRoot(t, doc, other)
+	ctx.mirrorFrom(t)
+
+	cloud.afterRootPut = func() {
+		d2, err := ctx.hashTree.FindDoc("doc-2")
+		require.NoError(t, err)
+		cloud.setRoot(t, d2) // doc-1 deleted by a concurrent writer
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	require.NotNil(t, res, "a superseded write must still return the populated result")
+	assert.NotEmpty(t, res.AfterRevision)
+
+	var superseded *SupersededError
+	require.True(t, errors.As(err, &superseded), "want *SupersededError, got %T", err)
+	assert.Equal(t, "", superseded.ActualRevision)
+	assert.Contains(t, err.Error(), "deleted")
+}
+
+// --- Round 5, item O: the API refuses empty tag lists for every op ---------
+
+func TestUpdateDocumentTagsRefusesEmptyTagListsAtTheApiLayer(t *testing.T) {
+	cases := []struct {
+		name    string
+		op      TagOp
+		tags    []string
+		wantErr string
+	}{
+		{"replace with nil", TagOpReplace, nil, "refusing to clear every tag"},
+		{"replace with empty slice", TagOpReplace, []string{}, "refusing to clear every tag"},
+		{"add with no tags", TagOpAdd, nil, "no tags given"},
+		{"remove with no tags", TagOpRemove, nil, "no tags given"},
+		{"a blank tag name", TagOpAdd, []string{"   "}, "empty tag name"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud, ctx := newFakeCloudCtx(t)
+			doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+			cloud.setRoot(t, doc)
+			ctx.mirrorFrom(t)
+			before := cloud.totalRequests
+
+			_, err := ctx.UpdateDocumentTags("doc-1", tc.op, tc.tags, "")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Equal(t, before, cloud.totalRequests, "an invalid tag operation must not reach the network")
+		})
+	}
+}
+
+// --- Round 5, item Q: the doc-index schema is threaded through -------------
+
+func TestUpdateDocumentTagsPreservesTheDocIndexSchemaVersion(t *testing.T) {
+	for _, schema := range []string{SchemaVersionV3, SchemaVersionV4} {
+		t.Run("schema "+schema, func(t *testing.T) {
+			cloud, ctx := newFakeCloudCtx(t)
+			doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+
+			// Rewrite doc-1's index blob under its own (unchanged) hash in
+			// the given schema, as a device-written index actually is --
+			// seedDoc always writes v3.
+			body := schema + "\n"
+			if schema == SchemaVersionV4 {
+				body += "0:.:" + strconv.Itoa(len(doc.Files)) + ":" + strconv.FormatInt(doc.Size, 10) + "\n"
+			}
+			for _, f := range doc.Files {
+				body += f.Line() + "\n"
+			}
+			cloud.blobs[doc.Hash] = []byte(body)
+			cloud.setRoot(t, doc)
+			ctx.mirrorFrom(t)
+
+			res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+			require.NoError(t, err)
+			require.True(t, res.Changed)
+
+			published := string(cloud.blobs[res.AfterRevision])
+			require.True(t, strings.HasPrefix(published, schema+"\n"), "published doc index must open with schema %q, got %q", schema, published)
+		})
+	}
+}
+
+func TestTagUpdatePlanDocHashDoesNotDependOnSchema(t *testing.T) {
+	// The doc hash a write publishes is fixed the moment planTagUpdate
+	// returns -- schema is set on the plan afterward (item Q) and affects
+	// only indexReader()'s output body, never plan.Result.AfterRevision:
+	// HashEntries (common.go) hashes each entry's own Hash bytes only, never
+	// the schema line.
+	doc := loadPreservationDoc(t)
+	plan, err := planOn(t, doc, TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	require.True(t, plan.Result.Changed)
+	wantHash, err := HashEntries(plan.files)
+	require.NoError(t, err)
+	require.Equal(t, wantHash, plan.Result.AfterRevision)
+
+	for _, schema := range []string{SchemaVersionV3, SchemaVersionV4} {
+		plan.schema = schema
+		r, err := plan.indexReader()
+		require.NoError(t, err)
+		body, err := io.ReadAll(r)
+		require.NoError(t, err)
+		assert.True(t, strings.HasPrefix(string(body), schema+"\n"))
+		assert.Equal(t, wantHash, plan.Result.AfterRevision, "changing plan.schema must never change the already-computed doc hash")
+	}
+}
+
+// --- Round 5, item R: lastModified never goes backwards ---------------------
+
+func TestPlanTagUpdateLastModifiedStampNeverMovesBackwards(t *testing.T) {
+	newMetadata := func(existing string) string {
+		if existing == "" {
+			return `{"type":"DocumentType","visibleName":"Field notes","parent":""}`
+		}
+		return `{"type":"DocumentType","visibleName":"Field notes","parent":"","lastModified":"` + existing + `"}`
+	}
+
+	cases := []struct {
+		name      string
+		existing  string
+		now       int64
+		wantStamp int64
+	}{
+		{"existing ahead of now", "9999999999999", 42, 9999999999999 + 1},
+		{"existing behind now", "1", 9999999999999, 9999999999999},
+		{"existing absent", "", 42, 42},
+	}
+
+	doc := loadPreservationDoc(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := newMetadata(tc.existing)
+			plan, err := planTagUpdate(doc, doc.Files, []byte(preservationContent), []byte(metadata), TagOpAdd, []string{"reviewed"}, "", tc.now)
+			require.NoError(t, err)
+			require.True(t, plan.Result.Changed)
+
+			want := strconv.FormatInt(tc.wantStamp, 10)
+			assert.Equal(t, want, plan.lastModified)
+
+			var got struct {
+				LastModified string `json:"lastModified"`
+			}
+			require.NoError(t, json.Unmarshal(plan.Metadata, &got))
+			assert.Equal(t, want, got.LastModified)
+
+			assert.NoError(t, verifyMetadataSplice([]byte(metadata), plan.Metadata, tc.wantStamp))
+		})
+	}
 }

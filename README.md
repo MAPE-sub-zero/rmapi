@@ -287,9 +287,11 @@ Use `stat entry` to dump its metadata as reported by the Cloud API.
 
 ## Setting tags
 
-Use `settag path tag1,tag2` to set a document's tags. `--add` and `--remove` change only the named tags; without a flag the tag set is replaced. An empty tag list is refused outright — use `--remove <tag,...>` to drop specific tags instead of clearing all of them. Tags are comma-separated, and a tag name cannot itself contain a comma (there is no escape for it).
+Use `settag path tag1,tag2` to set a document's tags. `--add` and `--remove` change only the named tags; without a flag the tag set is replaced. An empty tag list is refused outright for every operation, not just replace — `--add`/`--remove` with nothing named is a usage error, and so is a tag name that is blank once trimmed; use `--remove <tag,...>` to drop specific tags instead of clearing all of them. This guard lives at the API layer as well as in the shell, so a library caller going around the shell (`ApiCtx.UpdateDocumentTags`) cannot silently wipe a document's tags either. Tags are comma-separated, and a tag name cannot itself contain a comma (there is no escape for it).
 
-`--if-revision=<hash>` refuses the write if the document has changed since you read that hash. `settag --show path` is where that hash comes from: it prints the document's current revision and tags, and cannot be combined with `--add`, `--remove`, or `--if-revision`. The global `--json` flag prints the before/after result as JSON, including `afterRevision` — the value to pass to a later `--if-revision`.
+A tag or path that itself starts with `-` needs `--` before the positional arguments, or it is parsed as a flag: `settag -- notes/-todo -urgent`.
+
+`--if-revision=<hash>` refuses the write if the document has changed since you read that hash. `settag --show path` is where that hash comes from: it prints the document's current revision and tags, and cannot be combined with `--add`, `--remove`, or `--if-revision`. In a long-running shell session, `--show` reads the tree as of the shell's last refresh, not necessarily the live server; a fresh `rmapi settag --show` process is always current. The global `--json` flag prints the before/after result as JSON, including `afterRevision` — the value to pass to a later `--if-revision`. `pageTagCount` is `0` both when the document's content file has no `pageTags` member at all and when that member is present but empty — the two are not distinguished.
 
 ```
 settag notes/todo inbox,urgent
@@ -299,12 +301,12 @@ settag --show notes/todo
 rmapi --json settag --if-revision=<hash> notes/todo inbox
 ```
 
-On failure, `--json` also prints a structured error object with a `kind` field:
+On failure, `--json` also prints a structured error object with a `kind` field. Whether `result` is `null` or populated (with `afterRevision` reporting what this write attempted, whether or not it landed) depends on the kind:
 
-- `stale_revision` — `--if-revision` named a hash the document is no longer at.
-- `superseded` — the write landed, then a later writer replaced the document's revision.
-- `not_committed` — the write never reached the server at all.
-- `error` — anything else (a failed upload, a readback that could not verify the bytes it wrote, and so on).
+- `stale_revision` — `--if-revision` named a hash the document is no longer at. `result` is `null`: nothing was ever planned.
+- `superseded` — the write landed, then a later writer replaced the document's revision (or deleted the document outright — in that case `actualRevision` is omitted rather than printed empty). `result` is populated.
+- `not_committed` — the write never reached the server at all. `result` is populated.
+- `error` — anything else (a failed upload, a readback that could not verify the bytes it wrote, and so on). `result` is populated once a plan was actually built and applied locally, `null` for a failure before that point (a bad argument, a containment check, a corrupt remote index). If the error text names replica lag and `result.afterRevision` is populated, the write may already have landed on the server and a blind retry could double-apply it — stop and check `--show` (or the document itself) before retrying.
 
 # Run command non-interactively
 

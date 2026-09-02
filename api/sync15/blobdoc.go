@@ -108,6 +108,13 @@ type tagUpdatePlan struct {
 	// advanced past it) from "not committed" (nobody has).
 	generation int64
 	snapshot   *tagUpdateSnapshot
+
+	// schema is the doc-index schema the server served remoteFiles in
+	// (round 5, item Q). Set by the caller after planTagUpdate returns —
+	// planTagUpdate itself is schema-agnostic. Empty means "not set", which
+	// indexReader treats the same as IndexReaderWithSchema always has: the
+	// package default (v3).
+	schema string
 }
 
 // StaleRevisionError reports that the document moved under the caller.
@@ -195,7 +202,8 @@ func planTagUpdate(doc *BlobDoc, remoteFiles []*Entry, rawContent, rawMetadata [
 		return &tagUpdatePlan{Result: result}, nil
 	}
 
-	metadata, err := bumpMetadataLastModified(rawMetadata, now)
+	stamp := nextLastModified(rawMetadata, now)
+	metadata, err := bumpMetadataLastModified(rawMetadata, stamp)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", metadataName, err)
 	}
@@ -237,13 +245,52 @@ func planTagUpdate(doc *BlobDoc, remoteFiles []*Entry, rawContent, rawMetadata [
 		docHash:      docHash,
 		docSize:      docSize,
 		tags:         content.AfterTagSet,
-		lastModified: strconv.FormatInt(now, 10),
+		lastModified: strconv.FormatInt(stamp, 10),
 	}, nil
 }
 
-// indexReader returns the doc-index body for the plan's files.
+// nextLastModified computes the lastModified stamp a tag write should
+// publish (round 5, item R): now, unless that would move lastModified
+// backwards from what rawMetadata already records, in which case one
+// millisecond past the existing value instead. Device software and other
+// writers rely on lastModified only ever advancing; now can be behind the
+// document's own recorded value (a retried attempt whose now was hoisted
+// before a slow upload, or simple clock skew against whatever wrote the
+// existing value), and this write must never appear to move it backwards.
+// A missing or unparsable existing value is treated as 0, so a genuine now
+// always wins in that case.
+func nextLastModified(rawMetadata []byte, now int64) int64 {
+	existing := parseLastModified(rawMetadata)
+	if now > existing {
+		return now
+	}
+	return existing + 1
+}
+
+// parseLastModified reads the top-level "lastModified" member of a raw
+// .metadata blob as a decimal-string milliseconds value, the way the device
+// stores it. Absent or unparsable is reported as 0, never an error: this is
+// a monotonicity floor, not a validation of the document.
+func parseLastModified(rawMetadata []byte) int64 {
+	var m struct {
+		LastModified string `json:"lastModified"`
+	}
+	if err := json.Unmarshal(rawMetadata, &m); err != nil {
+		return 0
+	}
+	v, err := strconv.ParseInt(m.LastModified, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// indexReader returns the doc-index body for the plan's files, in the
+// schema the server served the document's index in (round 5, item Q). An
+// unset schema falls back to IndexReaderWithSchema's own default (v3),
+// exactly as calling IndexReader() always has.
 func (p *tagUpdatePlan) indexReader() (io.Reader, error) {
-	return (&BlobDoc{Files: p.files}).IndexReader()
+	return (&BlobDoc{Files: p.files}).IndexReaderWithSchema(p.schema)
 }
 
 // apply commits the plan to doc. It is the only place a tag write may mutate
@@ -919,6 +966,29 @@ func (d *BlobDoc) IndexReaderWithSchema(schema string) (io.Reader, error) {
 	var w bytes.Buffer
 	w.WriteString(schema)
 	w.WriteString("\n")
+
+	// A v4 body carries a header row (0:.:<entry count>:<total size>) right
+	// after the schema line, the same shape HashTree.IndexReader emits for
+	// the root index -- parseIndex's v4 branch requires it before reading
+	// entries. This was previously only ever emitted for the root index, so
+	// a doc index written under schema v4 could not be read back at all
+	// (round 5, item Q: threading the server's own schema through
+	// republishing makes this reachable for real, not just root indexes).
+	if schema == SchemaVersionV4 {
+		totalSize := int64(0)
+		for _, f := range d.Files {
+			totalSize += f.Size
+		}
+		w.WriteString("0")
+		w.WriteRune(Delimiter)
+		w.WriteString(".")
+		w.WriteRune(Delimiter)
+		w.WriteString(strconv.Itoa(len(d.Files)))
+		w.WriteRune(Delimiter)
+		w.WriteString(strconv.FormatInt(totalSize, 10))
+		w.WriteString("\n")
+	}
+
 	for _, f := range d.Files {
 		w.WriteString(f.Line())
 		w.WriteString("\n")
