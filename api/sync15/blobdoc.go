@@ -65,6 +65,30 @@ type TagUpdateResult struct {
 	MetadataHash   string   `json:"metadataHash,omitempty"`
 }
 
+// MarshalJSON normalizes nil BeforeTags/AfterTags to an empty array: a JSON
+// consumer should not have to distinguish "no tags" from "field omitted".
+func (r TagUpdateResult) MarshalJSON() ([]byte, error) {
+	type alias TagUpdateResult
+	out := alias(r)
+	if out.BeforeTags == nil {
+		out.BeforeTags = []string{}
+	}
+	if out.AfterTags == nil {
+		out.AfterTags = []string{}
+	}
+	return json.Marshal(out)
+}
+
+// tagUpdateSnapshot is doc's state immediately before apply overwrote it, so
+// a write that applied locally but never landed on the server can be undone.
+type tagUpdateSnapshot struct {
+	Hash         string
+	Size         int64
+	Files        []*Entry
+	DocumentTags []archive.Tag
+	LastModified string
+}
+
 // tagUpdatePlan is a prepared tag write: the report, the exact bytes to
 // upload, and the document state to apply once every upload has landed. A
 // no-op plan has Result.Changed false and nothing else set.
@@ -78,6 +102,12 @@ type tagUpdatePlan struct {
 	docSize      int64
 	tags         []archive.Tag
 	lastModified string
+
+	// generation is the tree generation Sync's closure saw when this plan
+	// was built — the readback's basis for telling "superseded" (someone
+	// advanced past it) from "not committed" (nobody has).
+	generation int64
+	snapshot   *tagUpdateSnapshot
 }
 
 // StaleRevisionError reports that the document moved under the caller.
@@ -102,23 +132,26 @@ func tagNames(tags []archive.Tag) []string {
 	return names
 }
 
-// planTagUpdate enforces the stale-revision precondition and computes a
-// tagUpdatePlan for op against rawContent/rawMetadata. It never modifies doc;
-// call plan.apply(doc) once every upload the plan describes has succeeded.
+// planTagUpdate enforces the stale-revision precondition (empty
+// expectedRevision skips it, for a blind write) and computes a tagUpdatePlan
+// for op against rawContent/rawMetadata. It never modifies doc; call
+// plan.apply(doc) once every upload the plan describes has succeeded.
+//
+// remoteFiles is the document's file list as read from the server at doc's
+// current hash, not doc.Files: sizes and membership come from what the
+// server holds, not a possibly-stale cache. Every entry other than the two
+// files this write may touch (.content, .metadata) survives byte-identical —
+// see assertBaseContainment.
 //
 // rawContent/rawMetadata are the raw blobs as stored, not the parsed
 // archive.Content / archive.MetadataFile: those structs model only part of
-// what the device writes, so serialising them back would drop every key they
-// do not know. The write replaces one member of each file and leaves every
-// other byte as it was.
+// what the device writes, so serialising them back would drop unknown keys.
+// The write replaces one member of each file and leaves every other byte.
 //
-// The precondition must be checked inside the Sync closure that calls this:
-// Sync re-runs its closure against a freshly mirrored tree on a generation
-// conflict, which is the concurrent change the precondition exists to catch.
-//
-// An empty expectedRevision skips the check, for callers that intend a blind
-// write.
-func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names []string, expectedRevision string, now int64) (*tagUpdatePlan, error) {
+// The precondition is checked inside the Sync closure that calls this: Sync
+// re-runs the closure on a generation conflict, which is the concurrent
+// change the precondition exists to catch.
+func planTagUpdate(doc *BlobDoc, remoteFiles []*Entry, rawContent, rawMetadata []byte, op TagOp, names []string, expectedRevision string, now int64) (*tagUpdatePlan, error) {
 	before := doc.Hash
 	if expectedRevision != "" && expectedRevision != before {
 		return nil, &StaleRevisionError{
@@ -128,9 +161,23 @@ func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 		}
 	}
 
+	contentName := addExt(doc.DocumentID, archive.ContentExt)
+	metadataName := addExt(doc.DocumentID, archive.MetadataExt)
+	var hasContent, hasMetadata bool
+	for _, e := range remoteFiles {
+		hasContent = hasContent || e.DocumentID == contentName
+		hasMetadata = hasMetadata || e.DocumentID == metadataName
+	}
+	if !hasContent {
+		return nil, fmt.Errorf("document %s has no %s entry", doc.DocumentID, archive.ContentExt)
+	}
+	if !hasMetadata {
+		return nil, fmt.Errorf("document %s has no %s entry", doc.DocumentID, archive.MetadataExt)
+	}
+
 	content, err := replaceContentTags(rawContent, op, names, now)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.ContentExt), err)
+		return nil, fmt.Errorf("%s: %w", contentName, err)
 	}
 
 	result := &TagUpdateResult{
@@ -148,11 +195,11 @@ func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 
 	metadata, err := bumpMetadataLastModified(rawMetadata, now)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.MetadataExt), err)
+		return nil, fmt.Errorf("%s: %w", metadataName, err)
 	}
 
-	files := make([]*Entry, len(doc.Files))
-	for i, f := range doc.Files {
+	files := make([]*Entry, len(remoteFiles))
+	for i, f := range remoteFiles {
 		c := *f
 		files[i] = &c
 	}
@@ -163,6 +210,10 @@ func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 	}
 	metadataHash, err := setEntryBlob(files, doc.DocumentID, archive.MetadataExt, metadata)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := assertBaseContainment(files, remoteFiles, doc.DocumentID); err != nil {
 		return nil, err
 	}
 
@@ -192,6 +243,36 @@ func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 	}, nil
 }
 
+// assertBaseContainment is the load-bearing half of "never destroy ink": a
+// tag write may change only .content and .metadata. It checks that files (the
+// plan's copy) preserves every other entry of base byte-identical, with
+// exactly the same membership.
+func assertBaseContainment(files, base []*Entry, docID string) error {
+	contentName := addExt(docID, archive.ContentExt)
+	metadataName := addExt(docID, archive.MetadataExt)
+
+	if len(files) != len(base) {
+		return fmt.Errorf("document %s: plan has %d files, base list has %d", docID, len(files), len(base))
+	}
+	byName := make(map[string]*Entry, len(files))
+	for _, f := range files {
+		byName[f.DocumentID] = f
+	}
+	for _, b := range base {
+		if b.DocumentID == contentName || b.DocumentID == metadataName {
+			continue
+		}
+		f, ok := byName[b.DocumentID]
+		if !ok {
+			return fmt.Errorf("document %s: plan is missing %s", docID, b.DocumentID)
+		}
+		if *f != *b {
+			return fmt.Errorf("document %s: plan changed %s, which a tag write must not touch", docID, b.DocumentID)
+		}
+	}
+	return nil
+}
+
 // indexReader returns the doc-index body for the plan's files.
 func (p *tagUpdatePlan) indexReader() (io.Reader, error) {
 	return (&BlobDoc{Files: p.files}).IndexReader()
@@ -199,13 +280,34 @@ func (p *tagUpdatePlan) indexReader() (io.Reader, error) {
 
 // apply commits the plan to doc. It is the only place a tag write may mutate
 // the tree, and must run only after every blob the plan names has been
-// uploaded.
+// uploaded. It snapshots doc's prior state first, so a write that applied
+// locally but never landed on the server can be undone with rollback.
 func (p *tagUpdatePlan) apply(doc *BlobDoc) {
+	p.snapshot = &tagUpdateSnapshot{
+		Hash:         doc.Hash,
+		Size:         doc.Size,
+		Files:        doc.Files,
+		DocumentTags: doc.Content.DocumentTags,
+		LastModified: doc.Metadata.LastModified,
+	}
 	doc.Files = p.files
 	doc.Size = p.docSize
 	doc.Hash = p.docHash
 	doc.Content.DocumentTags = p.tags
 	doc.Metadata.LastModified = p.lastModified
+}
+
+// rollback undoes apply: it restores doc to the state apply snapshotted. A
+// plan that was never applied has no snapshot and rollback is a no-op.
+func (p *tagUpdatePlan) rollback(doc *BlobDoc) {
+	if p.snapshot == nil {
+		return
+	}
+	doc.Hash = p.snapshot.Hash
+	doc.Size = p.snapshot.Size
+	doc.Files = p.snapshot.Files
+	doc.Content.DocumentTags = p.snapshot.DocumentTags
+	doc.Metadata.LastModified = p.snapshot.LastModified
 }
 
 // setEntryBlob points files' entry for docID's ext at blob's hash and size,
@@ -234,31 +336,36 @@ type contentTagsReplacement struct {
 	Changed      bool
 }
 
+// contentTagElement is one element of the "tags" array, kept by occurrence
+// rather than collapsed by name, so a document with duplicate-named tag
+// elements (the device allows this) keeps every occurrence's original bytes.
+type contentTagElement struct {
+	Bytes []byte
+	Tag   archive.Tag
+}
+
 // replaceContentTags applies op to the top-level "tags" member of a .content
 // blob. Every byte outside that member is unchanged, and tags that survive
-// the operation keep their original bytes, timestamps included. The document
-// is treated as opaque JSON: keys this version of rmapi does not know survive
-// because they are never parsed into a struct.
+// the operation keep their original bytes, timestamps included — matched by
+// occurrence, so two elements sharing a name are not collapsed into one. The
+// document is treated as opaque JSON: keys this version of rmapi does not
+// know survive because they are never parsed into a struct.
 func replaceContentTags(raw []byte, op TagOp, names []string, now int64) (*contentTagsReplacement, error) {
 	if !json.Valid(raw) {
 		return nil, errors.New("content blob is not valid JSON")
 	}
 
-	elements, err := jsonArrayMember(raw, "tags")
+	rawElements, err := jsonArrayMember(raw, "tags")
 	if err != nil {
 		return nil, fmt.Errorf("tags: %w", err)
 	}
-	existing := make([]archive.Tag, 0, len(elements))
-	original := make(map[string]json.RawMessage, len(elements))
-	for _, e := range elements {
+	existing := make([]contentTagElement, 0, len(rawElements))
+	for _, e := range rawElements {
 		var t archive.Tag
 		if err := json.Unmarshal(e, &t); err != nil {
 			return nil, fmt.Errorf("tags: element does not parse as a tag: %w", err)
 		}
-		existing = append(existing, t)
-		if _, dup := original[t.Name]; !dup {
-			original[t.Name] = e
-		}
+		existing = append(existing, contentTagElement{Bytes: e, Tag: t})
 	}
 
 	pageTags, err := jsonArrayMember(raw, "pageTags")
@@ -266,12 +373,17 @@ func replaceContentTags(raw []byte, op TagOp, names []string, now int64) (*conte
 		return nil, fmt.Errorf("pageTags: %w", err)
 	}
 
-	updated, changed := applyTags(existing, op, names, now)
+	updated, err := applyTagElements(existing, op, names, now)
+	if err != nil {
+		return nil, err
+	}
+	changed := !tagElementsEqual(existing, updated)
+
 	out := &contentTagsReplacement{
 		Bytes:        raw,
-		BeforeTags:   tagNames(existing),
-		AfterTags:    tagNames(updated),
-		AfterTagSet:  updated,
+		BeforeTags:   elementNames(existing),
+		AfterTags:    dedupPreserveOrder(elementNames(updated)),
+		AfterTagSet:  elementTags(updated),
 		PageTagCount: len(pageTags),
 		Changed:      changed,
 	}
@@ -281,19 +393,11 @@ func replaceContentTags(raw []byte, op TagOp, names []string, now int64) (*conte
 
 	var buf bytes.Buffer
 	buf.WriteByte('[')
-	for i, t := range updated {
+	for i, e := range updated {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		if prior, ok := original[t.Name]; ok && prior != nil {
-			buf.Write(prior)
-			continue
-		}
-		enc, err := json.Marshal(t)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(enc)
+		buf.Write(e.Bytes)
 	}
 	buf.WriteByte(']')
 
@@ -302,6 +406,125 @@ func replaceContentTags(raw []byte, op TagOp, names []string, now int64) (*conte
 		return nil, err
 	}
 	return out, nil
+}
+
+// applyTagElements computes the new element list for op. A surviving element
+// keeps its original bytes by occurrence, not by name, so duplicate-named
+// elements are never collided into one. Names being added are freshly
+// marshaled with now as the timestamp.
+func applyTagElements(existing []contentTagElement, op TagOp, names []string, now int64) ([]contentTagElement, error) {
+	wanted := dedupNames(names)
+	wantedSet := make(map[string]bool, len(wanted))
+	for _, n := range wanted {
+		wantedSet[n] = true
+	}
+	present := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		present[e.Tag.Name] = true
+	}
+
+	var result []contentTagElement
+	switch op {
+	case TagOpAdd:
+		result = append(result, existing...)
+		for _, n := range wanted {
+			if present[n] {
+				continue
+			}
+			e, err := newTagElement(n, now)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, e)
+		}
+	case TagOpRemove:
+		for _, e := range existing {
+			if !wantedSet[e.Tag.Name] {
+				result = append(result, e)
+			}
+		}
+	default: // TagOpReplace
+		for _, n := range wanted {
+			kept := false
+			for _, e := range existing {
+				if e.Tag.Name == n {
+					result = append(result, e)
+					kept = true
+				}
+			}
+			if !kept {
+				e, err := newTagElement(n, now)
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, e)
+			}
+		}
+	}
+	return result, nil
+}
+
+func newTagElement(name string, now int64) (contentTagElement, error) {
+	tag := archive.Tag{Name: name, Timestamp: now}
+	enc, err := json.Marshal(tag)
+	if err != nil {
+		return contentTagElement{}, err
+	}
+	return contentTagElement{Bytes: enc, Tag: tag}, nil
+}
+
+func dedupNames(names []string) []string {
+	wanted := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		wanted = append(wanted, n)
+	}
+	return wanted
+}
+
+func dedupPreserveOrder(names []string) []string {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}
+
+func elementNames(elems []contentTagElement) []string {
+	names := make([]string, 0, len(elems))
+	for _, e := range elems {
+		names = append(names, e.Tag.Name)
+	}
+	return names
+}
+
+func elementTags(elems []contentTagElement) []archive.Tag {
+	tags := make([]archive.Tag, 0, len(elems))
+	for _, e := range elems {
+		tags = append(tags, e.Tag)
+	}
+	return tags
+}
+
+func tagElementsEqual(a, b []contentTagElement) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Tag != b[i].Tag || !bytes.Equal(a[i].Bytes, b[i].Bytes) {
+			return false
+		}
+	}
+	return true
 }
 
 // bumpMetadataLastModified returns raw with only its top-level
@@ -318,9 +541,11 @@ func bumpMetadataLastModified(raw []byte, now int64) ([]byte, error) {
 	return spliceJSONMember(raw, "lastModified", value)
 }
 
-// verifyTagSplice is the readback for a prepared .content blob: independent
-// of the offsets the splice computed, it checks that spliced differs from
-// original in nothing but "tags", and that "tags" says what the caller meant.
+// verifyTagSplice is the readback for a prepared .content blob, independent
+// of the offsets the splice computed: spliced must differ from original in
+// nothing but "tags", "tags" must say what the caller meant, and every
+// surviving element must match its original bytes by occurrence, not just by
+// name (so duplicate-named elements can't be swapped or collided).
 func verifyTagSplice(original, spliced []byte, wantTags []string) error {
 	var before, after map[string]json.RawMessage
 	if err := json.Unmarshal(original, &before); err != nil {
@@ -334,8 +559,41 @@ func verifyTagSplice(original, spliced []byte, wantTags []string) error {
 	if err := json.Unmarshal(after["tags"], &tags); err != nil {
 		return fmt.Errorf("readback: spliced tags do not parse: %w", err)
 	}
-	if got := tagNames(tags); !stringsEqual(got, wantTags) {
+	if got := dedupPreserveOrder(tagNames(tags)); !stringsEqual(got, wantTags) {
 		return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
+	}
+
+	origElems, err := jsonArrayMember(original, "tags")
+	if err != nil {
+		return fmt.Errorf("readback: original tags: %w", err)
+	}
+	splicedElems, err := jsonArrayMember(spliced, "tags")
+	if err != nil {
+		return fmt.Errorf("readback: spliced tags: %w", err)
+	}
+	origByName := make(map[string][]json.RawMessage, len(origElems))
+	for _, e := range origElems {
+		var t archive.Tag
+		if err := json.Unmarshal(e, &t); err != nil {
+			return fmt.Errorf("readback: original tag element does not parse: %w", err)
+		}
+		origByName[t.Name] = append(origByName[t.Name], e)
+	}
+	consumed := make(map[string]int, len(origByName))
+	for _, e := range splicedElems {
+		var t archive.Tag
+		if err := json.Unmarshal(e, &t); err != nil {
+			return fmt.Errorf("readback: spliced tag element does not parse: %w", err)
+		}
+		bucket := origByName[t.Name]
+		idx := consumed[t.Name]
+		if idx >= len(bucket) {
+			continue // a genuinely new element; no original bytes to match
+		}
+		consumed[t.Name] = idx + 1
+		if !bytes.Equal(bytes.TrimSpace(e), bytes.TrimSpace(bucket[idx])) {
+			return fmt.Errorf("readback: tag element %q (occurrence %d) does not match its original bytes", t.Name, idx+1)
+		}
 	}
 
 	delete(before, "tags")
@@ -785,6 +1043,7 @@ func (d *BlobDoc) Mirror(e *Entry, r RemoteStorage) error {
 					return err
 				}
 				currentEntry.Hash = newEntry.Hash
+				currentEntry.Size = newEntry.Size
 			}
 			head = append(head, currentEntry)
 			current[currentEntry.DocumentID] = currentEntry

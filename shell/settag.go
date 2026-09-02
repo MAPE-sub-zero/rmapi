@@ -11,6 +11,57 @@ import (
 	"github.com/ogier/pflag"
 )
 
+// settagErrorOutput is the JSON error object settag prints on stdout in
+// --json mode. The shell's normal exit path (c.Err) is unchanged; this is
+// additional, not instead of.
+type settagErrorOutput struct {
+	Error            string                  `json:"error"`
+	Kind             string                  `json:"kind"`
+	DocumentID       string                  `json:"documentId"`
+	ExpectedRevision string                  `json:"expectedRevision,omitempty"`
+	ActualRevision   string                  `json:"actualRevision,omitempty"`
+	Result           *sync15.TagUpdateResult `json:"result"`
+}
+
+// settagErrorKind classifies err by errors.As against the sentinel-carrying
+// error types UpdateDocumentTags can return, for the "kind" field of the
+// JSON error object.
+func settagErrorKind(err error) (kind, expected, actual string) {
+	var stale *sync15.StaleRevisionError
+	if errors.As(err, &stale) {
+		return "stale_revision", stale.Expected, stale.Actual
+	}
+	var superseded *sync15.SupersededError
+	if errors.As(err, &superseded) {
+		return "superseded", superseded.ExpectedRevision, superseded.ActualRevision
+	}
+	var notCommitted *sync15.NotCommittedError
+	if errors.As(err, &notCommitted) {
+		return "not_committed", notCommitted.ExpectedRevision, notCommitted.ActualRevision
+	}
+	return "error", "", ""
+}
+
+// printSettagErrorJSON prints the structured JSON error object for a failed
+// settag call. It is best-effort: a marshal failure here must not hide the
+// original error, which the caller still reports via c.Err.
+func printSettagErrorJSON(c *ishell.Context, docId string, err error, result *sync15.TagUpdateResult) {
+	kind, expected, actual := settagErrorKind(err)
+	out := settagErrorOutput{
+		Error:            err.Error(),
+		Kind:             kind,
+		DocumentID:       docId,
+		ExpectedRevision: expected,
+		ActualRevision:   actual,
+		Result:           result,
+	}
+	b, mErr := json.MarshalIndent(out, "", "  ")
+	if mErr != nil {
+		return
+	}
+	c.Println(string(b))
+}
+
 // parseTags parses a comma-separated tag string into a slice of non-empty trimmed tag names.
 func parseTags(tagsStr string) []string {
 	if strings.TrimSpace(tagsStr) == "" {
@@ -131,6 +182,9 @@ Tags are comma-separated. With no operation flag the document's tags are replace
 			result, err := ctx.api.UpdateDocumentTags(
 				node.Document.ID, args.Op, args.Tags, args.ExpectedRevision)
 			if err != nil {
+				if ctx.JSONOutput {
+					printSettagErrorJSON(c, node.Document.ID, err, result)
+				}
 				c.Err(fmt.Errorf("failed to set tags: %w", err))
 				return
 			}

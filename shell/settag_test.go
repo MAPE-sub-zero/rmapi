@@ -1,6 +1,10 @@
 package shell
 
 import (
+	"encoding/json"
+	"io"
+	"os"
+	"syscall"
 	"testing"
 
 	"github.com/juruen/rmapi/api"
@@ -10,6 +14,35 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// captureStdout runs fn with file descriptor 1 redirected to a pipe and
+// returns everything written to it. Reassigning the os.Stdout *package
+// variable* is not enough here: the readline library RunShell's ishell.Shell
+// depends on binds its own default writer to os.Stdout once, at that
+// package's init time (github.com/abiosoft/readline/std.go), so it already
+// holds the original *os.File and never observes a later os.Stdout
+// reassignment. Redirecting the underlying fd with dup2 affects that
+// captured reference too, since it is the same OS file descriptor.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+
+	fd := int(os.Stdout.Fd())
+	savedFd, err := syscall.Dup(fd)
+	require.NoError(t, err)
+	require.NoError(t, syscall.Dup2(int(w.Fd()), fd))
+
+	fn()
+
+	require.NoError(t, w.Close())
+	require.NoError(t, syscall.Dup2(savedFd, fd))
+	require.NoError(t, syscall.Close(savedFd))
+
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return string(out)
+}
 
 func TestParseTags(t *testing.T) {
 	tests := []struct {
@@ -240,7 +273,10 @@ func (m *mockApiCtx) UpdateDocumentTags(docId string, op sync15.TagOp, tags []st
 	m.expectedRevision = expectedRevision
 
 	if m.err != nil {
-		return nil, m.err
+		// The real ApiCtx.UpdateDocumentTags returns (result, err) together on
+		// a superseded/not-committed readback failure, so callers keep
+		// AfterRevision; m.result lets a test simulate that.
+		return m.result, m.err
 	}
 	if m.result != nil {
 		return m.result, nil
@@ -357,12 +393,94 @@ func TestSettagCommandChangedCallsSync(t *testing.T) {
 
 func TestSettagCommandJSONOutput(t *testing.T) {
 	_, mock, userInfo := newSettagTestFixture()
+	mock.result = &sync15.TagUpdateResult{
+		DocumentID:     "doc-uuid-123",
+		Operation:      "replace",
+		Changed:        true,
+		BeforeRevision: "rev-a",
+		AfterRevision:  "rev-b",
+		BeforeTags:     nil, // must still serialize as [], not null
+		AfterTags:      []string{"inbox"},
+		PageTagCount:   0,
+		ContentHash:    "c0c0",
+		MetadataHash:   "0a0a",
+	}
 
-	err := RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
-	require.NoError(t, err)
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+	})
+	require.NoError(t, runErr)
 
 	require.True(t, mock.called)
 	assert.True(t, mock.syncCompleteCalled)
+
+	for _, field := range []string{
+		`"documentId"`, `"operation"`, `"changed"`, `"beforeRevision"`, `"afterRevision"`,
+		`"beforeTags"`, `"afterTags"`, `"pageTagCount"`, `"contentHash"`, `"metadataHash"`,
+	} {
+		assert.Contains(t, out, field, "JSON output must contain the %s field", field)
+	}
+	assert.Contains(t, out, `"beforeTags": []`, "an empty tag list must serialize as [], not null")
+	assert.NotContains(t, out, `"beforeTags": null`)
+}
+
+func TestSettagCommandErrorNonJSONPrintsFailedToSetTags(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.err = &sync15.StaleRevisionError{DocumentID: "doc-uuid-123", Expected: "rev-a", Actual: "rev-b"}
+
+	err := RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to set tags")
+}
+
+func TestSettagCommandErrorJSONClassifiesSupersededAndNotCommittedAndKeepsTheResult(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{"superseded", &sync15.SupersededError{DocumentID: "doc-uuid-123", ExpectedRevision: "mine", ActualRevision: "theirs"}, "superseded"},
+		{"not committed", &sync15.NotCommittedError{DocumentID: "doc-uuid-123", ExpectedRevision: "mine", ActualRevision: "original"}, "not_committed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, mock, userInfo := newSettagTestFixture()
+			mock.err = tc.err
+			mock.result = &sync15.TagUpdateResult{DocumentID: "doc-uuid-123", AfterRevision: "mine"}
+
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+			})
+			require.Error(t, runErr)
+
+			var got map[string]interface{}
+			require.NoError(t, json.Unmarshal([]byte(out), &got), "stdout must be one JSON object: %s", out)
+			assert.Equal(t, tc.kind, got["kind"])
+			result, ok := got["result"].(map[string]interface{})
+			require.True(t, ok, "result must still be populated so callers keep AfterRevision")
+			assert.Equal(t, "mine", result["afterRevision"])
+		})
+	}
+}
+
+func TestSettagCommandErrorJSONPrintsStructuredErrorObject(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.err = &sync15.StaleRevisionError{DocumentID: "doc-uuid-123", Expected: "rev-a", Actual: "rev-b"}
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = RunShell(mock, userInfo, []string{"settag", "test-note", "inbox"}, true)
+	})
+	require.Error(t, runErr)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(out), &got), "stdout must be one JSON object: %s", out)
+	assert.Equal(t, "stale_revision", got["kind"])
+	assert.Equal(t, "doc-uuid-123", got["documentId"])
+	assert.Equal(t, "rev-a", got["expectedRevision"])
+	assert.Equal(t, "rev-b", got["actualRevision"])
+	assert.Contains(t, got["error"], "doc-uuid-123")
 }
 
 func TestSettagCommandRefusesAFolder(t *testing.T) {

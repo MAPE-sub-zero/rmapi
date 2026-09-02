@@ -474,12 +474,50 @@ func (ctx *ApiCtx) ReplaceDocumentFile(docId, sourceDocPath string, notify bool)
 // write that wrote nothing; returning an error leaves the remote untouched.
 var errTagWriteNoop = errors.New("tags already as requested")
 
+// SupersededError reports that the remote root has advanced past the
+// generation this write was based on, and docId is no longer at the
+// revision this write produced. The name is optimistic: reMarkable's sync
+// protocol gives no way to tell "this write landed, and a later writer has
+// since replaced it" apart from "this write never landed, and something
+// else advanced the root instead" — both look identical from the readback.
+// Treat this as ambiguous — unknown, needs investigation — never as
+// confirmation the write succeeded.
+type SupersededError struct {
+	DocumentID          string
+	ExpectedRevision    string // the revision this write produced
+	ActualRevision      string // what the remote root now lists
+	CommittedGeneration int64
+	CurrentGeneration   int64
+}
+
+func (e *SupersededError) Error() string {
+	return fmt.Sprintf(
+		"superseded (ambiguous): remote root now lists revision %s for %s, not the %s this write produced; the root advanced from generation %d to %d, which could mean this write landed and was later replaced, or that it never landed at all — the server does not distinguish the two",
+		e.ActualRevision, e.DocumentID, e.ExpectedRevision, e.CommittedGeneration, e.CurrentGeneration)
+}
+
+// NotCommittedError reports that a tag write never reached the server at
+// all — typically Sync's syncTry>10 fail-open, which returns nil locally
+// without ever landing a root write.
+type NotCommittedError struct {
+	DocumentID       string
+	ExpectedRevision string
+	ActualRevision   string
+}
+
+func (e *NotCommittedError) Error() string {
+	return fmt.Sprintf(
+		"not committed: remote root lists revision %s for %s, this write produced %s",
+		e.ActualRevision, e.DocumentID, e.ExpectedRevision)
+}
+
 // UpdateDocumentTags applies a tag operation to one document with a
 // stale-revision precondition, and returns a structured before/after report.
 //
 // Nothing in the tree is mutated until all three blobs (content, metadata,
 // doc index) have uploaded: plan.apply runs last inside the closure, so a
-// failed upload leaves the tree exactly as it found it.
+// failed upload leaves the tree exactly as it found it. If Sync itself later
+// fails (the root write never lands), the applied plan is rolled back.
 //
 // Sync's return value cannot be trusted for "did it land" on its own: after
 // ten generation conflicts it gives up and returns nil. So after Sync the
@@ -488,10 +526,19 @@ var errTagWriteNoop = errors.New("tags already as requested")
 func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, expectedRevision string) (*TagUpdateResult, error) {
 	var result *TagUpdateResult
 	var plan *tagUpdatePlan
+	var d *BlobDoc
+	var attemptedRoot string
+	applied := false
 
 	err := Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
-		d, err := t.FindDoc(docId)
+		applied = false
+		var err error
+		d, err = t.FindDoc(docId)
 		if err != nil {
+			return err
+		}
+
+		if err := ctx.assertRootContainment(t, docId, d); err != nil {
 			return err
 		}
 
@@ -516,10 +563,16 @@ func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, exp
 			return err
 		}
 
-		plan, err = planTagUpdate(d, rawContent, rawMetadata, op, tags, expectedRevision, time.Now().UnixMilli())
+		remoteFiles, err := ctx.fetchRemoteDocIndex(d)
 		if err != nil {
 			return err
 		}
+
+		plan, err = planTagUpdate(d, remoteFiles, rawContent, rawMetadata, op, tags, expectedRevision, time.Now().UnixMilli())
+		if err != nil {
+			return err
+		}
+		plan.generation = t.Generation
 		result = plan.Result
 		if !plan.Result.Changed {
 			return errTagWriteNoop
@@ -545,20 +598,106 @@ func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, exp
 		}
 
 		plan.apply(d)
-		return t.Rehash()
+		applied = true
+		if err := t.Rehash(); err != nil {
+			return err
+		}
+		// Captured now, not read back from ctx.hashTree.Hash after Sync
+		// returns: a generation conflict on this attempt makes Sync mirror
+		// the tree before retrying, which overwrites t.Hash with the
+		// server's (still-unwritten) state. This is the hash Sync is about
+		// to try to commit for this attempt, win or lose.
+		attemptedRoot = t.Hash
+		return nil
 	}, true)
+
 	if errors.Is(err, errTagWriteNoop) {
 		log.Info.Println("tags already as requested; nothing to write")
+		rootHash, _, rErr := ctx.blobStorage.GetRootIndex()
+		if rErr != nil {
+			return result, fmt.Errorf("readback: %w", rErr)
+		}
+		if rootHash != ctx.hashTree.Hash {
+			return result, errors.New("local cache does not match the server root; refusing to report a no-op")
+		}
 		return result, nil
 	}
 	if err != nil {
+		if applied && plan != nil && d != nil {
+			plan.rollback(d)
+			ctx.hashTree.Rehash()
+		}
 		return nil, err
 	}
 
-	if err := ctx.verifyTagWriteLanded(docId, plan); err != nil {
-		return nil, err
+	result, err = ctx.verifyTagWriteLanded(docId, plan, attemptedRoot)
+	if err != nil {
+		return result, err
 	}
+	ctx.ft = DocumentsFileTree(ctx.hashTree)
 	return result, nil
+}
+
+// fetchRemoteDocIndex reads a document's file index from the server at its
+// currently cached hash — the base a tag write plans against, so plan sizes
+// and membership come from what the server holds, not the local cache.
+func (ctx *ApiCtx) fetchRemoteDocIndex(d *BlobDoc) ([]*Entry, error) {
+	r, err := ctx.blobStorage.GetReader(d.Hash, addExt(d.DocumentID, archive.DocSchemaExt))
+	if err != nil {
+		return nil, fmt.Errorf("fetch remote index for %s: %w", d.DocumentID, err)
+	}
+	defer r.Close()
+	entries, _, err := parseIndex(r)
+	if err != nil {
+		return nil, fmt.Errorf("fetch remote index for %s: %w", d.DocumentID, err)
+	}
+	return entries, nil
+}
+
+// assertRootContainment reads the remote root index at the tree's own hash
+// and cross-checks the local cache against it, before any upload: every
+// document the server lists there must be present locally, and docId's own
+// entry must be at the revision the local cache believes it holds. This
+// catches a truncated or stale local cache — one that still names a valid,
+// existing server root, but no longer agrees with everything that root
+// lists — the pre-commit half of "never destroy ink".
+func (ctx *ApiCtx) assertRootContainment(t *HashTree, docId string, d *BlobDoc) error {
+	rootReader, err := ctx.blobStorage.GetReader(t.Hash, addExt("root", archive.DocSchemaExt))
+	if err != nil {
+		return fmt.Errorf("root containment check: %w", err)
+	}
+	defer rootReader.Close()
+	remoteRoot, _, err := parseIndex(rootReader)
+	if err != nil {
+		return fmt.Errorf("root containment check: %w", err)
+	}
+
+	localByID := make(map[string]*BlobDoc, len(t.Docs))
+	for _, ld := range t.Docs {
+		localByID[ld.DocumentID] = ld
+	}
+
+	var missing []string
+	var docEntry *Entry
+	for _, e := range remoteRoot {
+		if _, ok := localByID[e.DocumentID]; !ok {
+			missing = append(missing, e.DocumentID)
+		}
+		if e.DocumentID == docId {
+			docEntry = e
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"local cache is missing %d document(s) the server has (e.g. %s); delete tree.cache and retry",
+			len(missing), missing[0])
+	}
+	if docEntry != nil && docEntry.Hash != d.Hash {
+		return fmt.Errorf(
+			"cached revision %s for %s does not match the server's %s; delete tree.cache and retry",
+			d.Hash, docId, docEntry.Hash)
+	}
+	return nil
 }
 
 // fetchDocFile reads one of a document's files, by the hash its entry carries.
@@ -582,22 +721,57 @@ func (ctx *ApiCtx) fetchDocFile(d *BlobDoc, ext archive.RmExt) ([]byte, error) {
 	return nil, fmt.Errorf("document %s has no %s file", d.DocumentID, name)
 }
 
-// verifyTagWriteLanded proves the write from the server, not the local
-// cache: it reads the remote root index, finds docId's entry, and confirms
-// the doc index and both edited blobs it points at match what was sent.
-func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan) error {
-	rootHash, _, err := ctx.blobStorage.GetRootIndex()
+// verifyTagWriteLanded is the post-write readback: it proves the write from
+// the server, not the local cache. The root index itself is trusted via its
+// pointer, not re-downloaded on every path — content-addressing means a
+// matching root/doc hash already proves which bytes are named. But the two
+// blobs this write actually produced are verified by their bytes, not just
+// the hash chain: a server that acknowledges a blob PUT and silently drops
+// it would otherwise leave the root pointing at a doc index whose .content
+// or .metadata 404s — a broken notebook reported as success. See
+// verifyWriteSetLanded, which both "landed" branches below call before
+// returning success.
+//
+// If the live root hash already equals attemptedRoot — the root Sync's last
+// attempt actually tried to commit — the write landed at the root level.
+// attemptedRoot, not ctx.hashTree.Hash, is the right comparison: after a
+// generation conflict Sync mirrors the tree before retrying, which can leave
+// ctx.hashTree.Hash matching the live (still-unwritten) server root by the
+// time Sync gives up, which would otherwise read as a false "landed".
+//
+// Otherwise something else has changed the root since; the readback follows
+// it one level to docId's own entry. If that entry is still at the revision
+// this write produced, the write landed regardless of who moved the root.
+//
+// If not, and the root's generation is still the one this write was based
+// on, the write never committed at all (NotCommittedError — Sync's
+// syncTry>10 fail-open, most often; unambiguous, since nobody else could
+// have advanced the generation either). If the generation has moved past
+// that, SupersededError is reported — but that is ambiguous by construction:
+// the server gives no way to tell "this write landed, then something else
+// replaced it" from "this write never landed, and something else advanced
+// the root instead." Callers must treat it as unknown, not as confirmation
+// the write succeeded.
+func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan, attemptedRoot string) (*TagUpdateResult, error) {
+	rootHash, generation, err := ctx.blobStorage.GetRootIndex()
 	if err != nil {
-		return fmt.Errorf("readback: %w", err)
+		return plan.Result, fmt.Errorf("readback: %w", err)
 	}
+	if rootHash == attemptedRoot {
+		if err := ctx.verifyWriteSetLanded(docId, plan); err != nil {
+			return plan.Result, err
+		}
+		return plan.Result, nil
+	}
+
 	rootReader, err := ctx.blobStorage.GetReader(rootHash, addExt("root", archive.DocSchemaExt))
 	if err != nil {
-		return fmt.Errorf("readback: %w", err)
+		return plan.Result, fmt.Errorf("readback: %w", err)
 	}
 	defer rootReader.Close()
 	rootEntries, _, err := parseIndex(rootReader)
 	if err != nil {
-		return fmt.Errorf("readback: %w", err)
+		return plan.Result, fmt.Errorf("readback: %w", err)
 	}
 
 	var docEntry *Entry
@@ -608,15 +782,38 @@ func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan) error
 		}
 	}
 	if docEntry == nil {
-		return fmt.Errorf("readback: remote root does not list %s", docId)
+		return plan.Result, fmt.Errorf("readback: remote root does not list %s", docId)
 	}
-	if docEntry.Hash != plan.Result.AfterRevision {
-		return fmt.Errorf(
-			"tag write for %s was not committed: remote root lists revision %s, this write produced %s",
-			docId, docEntry.Hash, plan.Result.AfterRevision)
+	if docEntry.Hash == plan.Result.AfterRevision {
+		if err := ctx.verifyWriteSetLanded(docId, plan); err != nil {
+			return plan.Result, err
+		}
+		return plan.Result, nil
 	}
 
-	docReader, err := ctx.blobStorage.GetReader(docEntry.Hash, addExt(docId, archive.DocSchemaExt))
+	if generation > plan.generation {
+		return plan.Result, &SupersededError{
+			DocumentID:          docId,
+			ExpectedRevision:    plan.Result.AfterRevision,
+			ActualRevision:      docEntry.Hash,
+			CommittedGeneration: plan.generation,
+			CurrentGeneration:   generation,
+		}
+	}
+	return plan.Result, &NotCommittedError{
+		DocumentID:       docId,
+		ExpectedRevision: plan.Result.AfterRevision,
+		ActualRevision:   docEntry.Hash,
+	}
+}
+
+// verifyWriteSetLanded proves, by bytes rather than by hash chain alone,
+// that the exact blobs this write produced are retrievable from the server:
+// the doc index at plan.Result.AfterRevision, and the .content/.metadata
+// blobs it names. Three small GETs of only the bytes this write sent — no
+// root index, no ink blobs.
+func (ctx *ApiCtx) verifyWriteSetLanded(docId string, plan *tagUpdatePlan) error {
+	docReader, err := ctx.blobStorage.GetReader(plan.Result.AfterRevision, addExt(docId, archive.DocSchemaExt))
 	if err != nil {
 		return fmt.Errorf("readback: %w", err)
 	}
@@ -643,10 +840,10 @@ func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan) error
 			}
 		}
 		if fileEntry == nil {
-			return fmt.Errorf("readback: remote doc index for %s has no %s entry", docId, want.ext)
+			return fmt.Errorf("readback: doc index for %s has no %s entry", docId, want.ext)
 		}
 		if fileEntry.Hash != want.hash {
-			return fmt.Errorf("readback: remote %s is at hash %s, this write produced %s", name, fileEntry.Hash, want.hash)
+			return fmt.Errorf("readback: doc index for %s lists %s at %s, this write produced %s", docId, name, fileEntry.Hash, want.hash)
 		}
 
 		got, err := ctx.blobStorage.GetReader(fileEntry.Hash, name)
@@ -659,16 +856,8 @@ func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan) error
 			return fmt.Errorf("readback: %w", err)
 		}
 		if !bytes.Equal(gotBytes, want.sent) {
-			return fmt.Errorf("readback: remote %s differs from what this write sent", name)
+			return fmt.Errorf("readback: %s differs from what this write sent", name)
 		}
-	}
-
-	d, err := ctx.hashTree.FindDoc(docId)
-	if err != nil {
-		return fmt.Errorf("readback: %w", err)
-	}
-	if d.Hash != plan.Result.AfterRevision {
-		return fmt.Errorf("readback: local tree is at %s, remote at %s", d.Hash, plan.Result.AfterRevision)
 	}
 	return nil
 }
