@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -476,54 +477,46 @@ var errTagWriteNoop = errors.New("tags already as requested")
 // UpdateDocumentTags applies a tag operation to one document with a
 // stale-revision precondition, and returns a structured before/after report.
 //
-// The document's .content and .metadata blobs are fetched by hash inside the
-// operation closure and edited as opaque bytes (see PlanTagUpdate): the hash
-// tree's parsed copies are partial models and are never serialised back.
-// Fetching by hash also means the bytes edited are exactly the bytes the
-// current tree references, however stale the parsed copies are.
+// Nothing in the tree is mutated until all three blobs (content, metadata,
+// doc index) have uploaded: plan.apply runs last inside the closure, so a
+// failed upload leaves the tree exactly as it found it.
 //
-// The precondition is checked inside the closure. Sync re-runs its closure
-// against a freshly mirrored tree when the remote generation moved, which is
-// exactly the concurrent change the precondition exists to refuse; a check
-// made once outside would let it through on the retry.
-//
-// Sync's own return value cannot be trusted for "did it land": it gives up
-// after ten generation conflicts by breaking out of its loop and returning
-// nil, with the tree re-mirrored from the remote. So after Sync the document
-// is looked up again in the tree and its .content and .metadata entries must
-// carry the hashes this write produced — after a gave-up Sync they carry the
-// remote's — and both blobs are read back through the transport and compared
-// byte for byte with what was sent. A concurrent writer landing between Sync
-// and that readback is reported as a mismatch rather than hidden.
+// Sync's return value cannot be trusted for "did it land" on its own: after
+// ten generation conflicts it gives up and returns nil. So after Sync the
+// write is verified against the remote root, not the local cache — see
+// verifyTagWriteLanded.
 func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, expectedRevision string) (*TagUpdateResult, error) {
-	if _, err := ctx.hashTree.FindDoc(docId); err != nil {
-		return nil, err
-	}
-
 	var result *TagUpdateResult
-	var plan *TagUpdatePlan
+	var plan *tagUpdatePlan
 
 	err := Sync(ctx.blobStorage, ctx.hashTree, func(t *HashTree) error {
 		d, err := t.FindDoc(docId)
 		if err != nil {
 			return err
 		}
-		// Entry.Type is the index column ("0" / "80000000"), not the kind of
-		// node; the kind lives in .metadata, as ToDocument reads it.
-		if d.Metadata.CollectionType != model.DocumentType {
-			return fmt.Errorf("%s is a %q, not a document", docId, d.Metadata.CollectionType)
+
+		rawMetadata, err := ctx.fetchDocFile(d, archive.MetadataExt)
+		if err != nil {
+			return err
+		}
+		// The kind lives in the raw bytes, not d.Metadata: Mirror may skip
+		// re-parsing a document whose hash it already recognises.
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(rawMetadata, &kind); err != nil {
+			return fmt.Errorf("%s: %w", addExt(docId, archive.MetadataExt), err)
+		}
+		if kind.Type != model.DocumentType {
+			return fmt.Errorf("%s is a %q, not a document", docId, kind.Type)
 		}
 
 		rawContent, err := ctx.fetchDocFile(d, archive.ContentExt)
 		if err != nil {
 			return err
 		}
-		rawMetadata, err := ctx.fetchDocFile(d, archive.MetadataExt)
-		if err != nil {
-			return err
-		}
 
-		plan, err = PlanTagUpdate(d, rawContent, rawMetadata, op, tags, expectedRevision, time.Now().UnixMilli())
+		plan, err = planTagUpdate(d, rawContent, rawMetadata, op, tags, expectedRevision, time.Now().UnixMilli())
 		if err != nil {
 			return err
 		}
@@ -532,11 +525,7 @@ func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, exp
 			return errTagWriteNoop
 		}
 
-		if err := VerifyTagSplice(rawContent, plan.Content, plan.Result.AfterTags); err != nil {
-			return err
-		}
-
-		if err := t.Rehash(); err != nil {
+		if err := verifyTagSplice(rawContent, plan.Content, plan.Result.AfterTags); err != nil {
 			return err
 		}
 
@@ -547,11 +536,16 @@ func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, exp
 			return err
 		}
 
-		indexReader, err := d.IndexReader()
+		idx, err := plan.indexReader()
 		if err != nil {
 			return err
 		}
-		return ctx.blobStorage.UploadBlob(d.Hash, addExt(d.DocumentID, archive.DocSchemaExt), indexReader)
+		if err := ctx.blobStorage.UploadBlob(plan.docHash, addExt(d.DocumentID, archive.DocSchemaExt), idx); err != nil {
+			return err
+		}
+
+		plan.apply(d)
+		return t.Rehash()
 	}, true)
 	if errors.Is(err, errTagWriteNoop) {
 		log.Info.Println("tags already as requested; nothing to write")
@@ -559,9 +553,6 @@ func (ctx *ApiCtx) UpdateDocumentTags(docId string, op TagOp, tags []string, exp
 	}
 	if err != nil {
 		return nil, err
-	}
-	if result == nil || plan == nil {
-		return nil, errors.New("tag update did not run")
 	}
 
 	if err := ctx.verifyTagWriteLanded(docId, plan); err != nil {
@@ -591,18 +582,50 @@ func (ctx *ApiCtx) fetchDocFile(d *BlobDoc, ext archive.RmExt) ([]byte, error) {
 	return nil, fmt.Errorf("document %s has no %s file", d.DocumentID, name)
 }
 
-// verifyTagWriteLanded is the post-write readback described on
-// UpdateDocumentTags.
-func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *TagUpdatePlan) error {
-	d, err := ctx.hashTree.FindDoc(docId)
+// verifyTagWriteLanded proves the write from the server, not the local
+// cache: it reads the remote root index, finds docId's entry, and confirms
+// the doc index and both edited blobs it points at match what was sent.
+func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *tagUpdatePlan) error {
+	rootHash, _, err := ctx.blobStorage.GetRootIndex()
 	if err != nil {
 		return fmt.Errorf("readback: %w", err)
 	}
-	if d.Hash != plan.Result.AfterRevision {
-		return fmt.Errorf(
-			"tag write for %s was not committed: document is at revision %s, this write produced %s",
-			docId, d.Hash, plan.Result.AfterRevision)
+	rootReader, err := ctx.blobStorage.GetReader(rootHash, addExt("root", archive.DocSchemaExt))
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
 	}
+	defer rootReader.Close()
+	rootEntries, _, err := parseIndex(rootReader)
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
+	}
+
+	var docEntry *Entry
+	for _, e := range rootEntries {
+		if e.DocumentID == docId {
+			docEntry = e
+			break
+		}
+	}
+	if docEntry == nil {
+		return fmt.Errorf("readback: remote root does not list %s", docId)
+	}
+	if docEntry.Hash != plan.Result.AfterRevision {
+		return fmt.Errorf(
+			"tag write for %s was not committed: remote root lists revision %s, this write produced %s",
+			docId, docEntry.Hash, plan.Result.AfterRevision)
+	}
+
+	docReader, err := ctx.blobStorage.GetReader(docEntry.Hash, addExt(docId, archive.DocSchemaExt))
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
+	}
+	defer docReader.Close()
+	docEntries, _, err := parseIndex(docReader)
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
+	}
+
 	for _, want := range []struct {
 		ext  archive.RmExt
 		hash string
@@ -611,13 +634,41 @@ func (ctx *ApiCtx) verifyTagWriteLanded(docId string, plan *TagUpdatePlan) error
 		{archive.ContentExt, plan.Result.ContentHash, plan.Content},
 		{archive.MetadataExt, plan.Result.MetadataHash, plan.Metadata},
 	} {
-		got, err := ctx.fetchDocFile(d, want.ext)
+		name := addExt(docId, want.ext)
+		var fileEntry *Entry
+		for _, e := range docEntries {
+			if e.DocumentID == name {
+				fileEntry = e
+				break
+			}
+		}
+		if fileEntry == nil {
+			return fmt.Errorf("readback: remote doc index for %s has no %s entry", docId, want.ext)
+		}
+		if fileEntry.Hash != want.hash {
+			return fmt.Errorf("readback: remote %s is at hash %s, this write produced %s", name, fileEntry.Hash, want.hash)
+		}
+
+		got, err := ctx.blobStorage.GetReader(fileEntry.Hash, name)
 		if err != nil {
 			return fmt.Errorf("readback: %w", err)
 		}
-		if !bytes.Equal(got, want.sent) {
-			return fmt.Errorf("readback: remote %s differs from what this write sent", addExt(docId, want.ext))
+		gotBytes, err := io.ReadAll(got)
+		got.Close()
+		if err != nil {
+			return fmt.Errorf("readback: %w", err)
 		}
+		if !bytes.Equal(gotBytes, want.sent) {
+			return fmt.Errorf("readback: remote %s differs from what this write sent", name)
+		}
+	}
+
+	d, err := ctx.hashTree.FindDoc(docId)
+	if err != nil {
+		return fmt.Errorf("readback: %w", err)
+	}
+	if d.Hash != plan.Result.AfterRevision {
+		return fmt.Errorf("readback: local tree is at %s, remote at %s", d.Hash, plan.Result.AfterRevision)
 	}
 	return nil
 }

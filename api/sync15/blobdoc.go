@@ -65,13 +65,19 @@ type TagUpdateResult struct {
 	MetadataHash   string   `json:"metadataHash,omitempty"`
 }
 
-// TagUpdatePlan is a prepared tag write: the report, plus the exact bytes to
-// upload. A no-op plan has Changed false and nil blobs, and must not be
-// uploaded.
-type TagUpdatePlan struct {
+// tagUpdatePlan is a prepared tag write: the report, the exact bytes to
+// upload, and the document state to apply once every upload has landed. A
+// no-op plan has Result.Changed false and nothing else set.
+type tagUpdatePlan struct {
 	Result   *TagUpdateResult
 	Content  []byte
 	Metadata []byte
+
+	files        []*Entry
+	docHash      string
+	docSize      int64
+	tags         []archive.Tag
+	lastModified string
 }
 
 // StaleRevisionError reports that the document moved under the caller.
@@ -87,8 +93,8 @@ func (e *StaleRevisionError) Error() string {
 		e.DocumentID, e.Actual, e.Expected)
 }
 
-// TagNames returns just the names of a tag set, in order.
-func TagNames(tags []archive.Tag) []string {
+// tagNames returns just the names of a tag set, in order.
+func tagNames(tags []archive.Tag) []string {
 	names := make([]string, 0, len(tags))
 	for _, t := range tags {
 		names = append(names, t.Name)
@@ -96,24 +102,23 @@ func TagNames(tags []archive.Tag) []string {
 	return names
 }
 
-// PlanTagUpdate enforces the stale-revision precondition, applies op to the
-// document's .content and .metadata bytes, and prepares the blobs to upload.
-// It reports a no-op rather than writing one.
+// planTagUpdate enforces the stale-revision precondition and computes a
+// tagUpdatePlan for op against rawContent/rawMetadata. It never modifies doc;
+// call plan.apply(doc) once every upload the plan describes has succeeded.
 //
-// The inputs are the raw blobs as stored, not the parsed archive.Content and
-// archive.MetadataFile: those structs model only part of what the device
-// writes, so serialising them back over an existing document would drop every
-// key they do not know. The write here replaces one member of each file and
-// leaves every other byte as it was.
+// rawContent/rawMetadata are the raw blobs as stored, not the parsed
+// archive.Content / archive.MetadataFile: those structs model only part of
+// what the device writes, so serialising them back would drop every key they
+// do not know. The write replaces one member of each file and leaves every
+// other byte as it was.
 //
-// The precondition must be evaluated wherever this is called from inside a
-// Sync operation closure: Sync re-runs its closure against a freshly mirrored
-// tree when the remote generation moved, so a check made once outside that
-// closure would not see the concurrent change it exists to catch.
+// The precondition must be checked inside the Sync closure that calls this:
+// Sync re-runs its closure against a freshly mirrored tree on a generation
+// conflict, which is the concurrent change the precondition exists to catch.
 //
-// An empty expectedRevision skips the check, for callers that genuinely intend
-// a blind write.
-func PlanTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names []string, expectedRevision string, now int64) (*TagUpdatePlan, error) {
+// An empty expectedRevision skips the check, for callers that intend a blind
+// write.
+func planTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names []string, expectedRevision string, now int64) (*tagUpdatePlan, error) {
 	before := doc.Hash
 	if expectedRevision != "" && expectedRevision != before {
 		return nil, &StaleRevisionError{
@@ -123,7 +128,7 @@ func PlanTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 		}
 	}
 
-	content, err := ReplaceContentTags(rawContent, op, names, now)
+	content, err := replaceContentTags(rawContent, op, names, now)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.ContentExt), err)
 	}
@@ -138,70 +143,103 @@ func PlanTagUpdate(doc *BlobDoc, rawContent, rawMetadata []byte, op TagOp, names
 		PageTagCount:   content.PageTagCount,
 	}
 	if !content.Changed {
-		return &TagUpdatePlan{Result: result}, nil
+		return &tagUpdatePlan{Result: result}, nil
 	}
 
-	metadata, err := BumpMetadataLastModified(rawMetadata, now)
+	metadata, err := bumpMetadataLastModified(rawMetadata, now)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", addExt(doc.DocumentID, archive.MetadataExt), err)
 	}
 
-	contentHash, err := doc.setFileBlob(archive.ContentExt, content.Bytes)
+	files := make([]*Entry, len(doc.Files))
+	for i, f := range doc.Files {
+		c := *f
+		files[i] = &c
+	}
+
+	contentHash, err := setEntryBlob(files, doc.DocumentID, archive.ContentExt, content.Bytes)
 	if err != nil {
 		return nil, err
 	}
-	metadataHash, err := doc.setFileBlob(archive.MetadataExt, metadata)
+	metadataHash, err := setEntryBlob(files, doc.DocumentID, archive.MetadataExt, metadata)
 	if err != nil {
 		return nil, err
 	}
-	if err := doc.Rehash(); err != nil {
+
+	docHash, err := HashEntries(files)
+	if err != nil {
 		return nil, err
+	}
+	var docSize int64
+	for _, f := range files {
+		docSize += f.Size
 	}
 
 	result.Changed = true
-	result.AfterRevision = doc.Hash
+	result.AfterRevision = docHash
 	result.ContentHash = contentHash
 	result.MetadataHash = metadataHash
 
-	return &TagUpdatePlan{
-		Result:   result,
-		Content:  content.Bytes,
-		Metadata: metadata,
+	return &tagUpdatePlan{
+		Result:       result,
+		Content:      content.Bytes,
+		Metadata:     metadata,
+		files:        files,
+		docHash:      docHash,
+		docSize:      docSize,
+		tags:         content.AfterTagSet,
+		lastModified: strconv.FormatInt(now, 10),
 	}, nil
 }
 
-// setFileBlob points the document's entry for the file with extension ext at
-// blob, and returns the blob's hash.
-func (d *BlobDoc) setFileBlob(ext archive.RmExt, blob []byte) (string, error) {
+// indexReader returns the doc-index body for the plan's files.
+func (p *tagUpdatePlan) indexReader() (io.Reader, error) {
+	return (&BlobDoc{Files: p.files}).IndexReader()
+}
+
+// apply commits the plan to doc. It is the only place a tag write may mutate
+// the tree, and must run only after every blob the plan names has been
+// uploaded.
+func (p *tagUpdatePlan) apply(doc *BlobDoc) {
+	doc.Files = p.files
+	doc.Size = p.docSize
+	doc.Hash = p.docHash
+	doc.Content.DocumentTags = p.tags
+	doc.Metadata.LastModified = p.lastModified
+}
+
+// setEntryBlob points files' entry for docID's ext at blob's hash and size,
+// matching by the exact name addExt(docID, ext) produces.
+func setEntryBlob(files []*Entry, docID string, ext archive.RmExt, blob []byte) (string, error) {
+	name := addExt(docID, ext)
 	sum := sha256.Sum256(blob)
 	hash := hex.EncodeToString(sum[:])
-	for _, f := range d.Files {
-		if strings.HasSuffix(f.DocumentID, "."+string(ext)) {
+	for _, f := range files {
+		if f.DocumentID == name {
 			f.Hash = hash
 			f.Size = int64(len(blob))
 			return hash, nil
 		}
 	}
-	return "", fmt.Errorf("document %s has no %s entry", d.DocumentID, ext)
+	return "", fmt.Errorf("document %s has no %s entry", docID, ext)
 }
 
-// ContentTagsReplacement is the outcome of ReplaceContentTags.
-type ContentTagsReplacement struct {
+// contentTagsReplacement is the outcome of replaceContentTags.
+type contentTagsReplacement struct {
 	Bytes        []byte
 	BeforeTags   []string
 	AfterTags    []string
+	AfterTagSet  []archive.Tag
 	PageTagCount int
 	Changed      bool
 }
 
-// ReplaceContentTags applies op to the top-level "tags" member of a .content
-// blob and returns the new blob. Every byte outside that member is unchanged,
-// and tags that survive the operation keep their original bytes, timestamps
-// included. When op changes nothing, Bytes is raw itself and Changed is false.
-//
-// The document is treated as an opaque JSON object: keys this version of rmapi
-// has never heard of survive because they are never parsed into a struct.
-func ReplaceContentTags(raw []byte, op TagOp, names []string, now int64) (*ContentTagsReplacement, error) {
+// replaceContentTags applies op to the top-level "tags" member of a .content
+// blob. Every byte outside that member is unchanged, and tags that survive
+// the operation keep their original bytes, timestamps included. The document
+// is treated as opaque JSON: keys this version of rmapi does not know survive
+// because they are never parsed into a struct.
+func replaceContentTags(raw []byte, op TagOp, names []string, now int64) (*contentTagsReplacement, error) {
 	if !json.Valid(raw) {
 		return nil, errors.New("content blob is not valid JSON")
 	}
@@ -228,11 +266,12 @@ func ReplaceContentTags(raw []byte, op TagOp, names []string, now int64) (*Conte
 		return nil, fmt.Errorf("pageTags: %w", err)
 	}
 
-	updated, changed := ApplyTags(existing, op, names, now)
-	out := &ContentTagsReplacement{
+	updated, changed := applyTags(existing, op, names, now)
+	out := &contentTagsReplacement{
 		Bytes:        raw,
-		BeforeTags:   TagNames(existing),
-		AfterTags:    TagNames(updated),
+		BeforeTags:   tagNames(existing),
+		AfterTags:    tagNames(updated),
+		AfterTagSet:  updated,
 		PageTagCount: len(pageTags),
 		Changed:      changed,
 	}
@@ -265,10 +304,10 @@ func ReplaceContentTags(raw []byte, op TagOp, names []string, now int64) (*Conte
 	return out, nil
 }
 
-// BumpMetadataLastModified returns the .metadata blob with only its top-level
-// "lastModified" member set to now (as the device stores it: a decimal string
-// of milliseconds). Every other byte is unchanged.
-func BumpMetadataLastModified(raw []byte, now int64) ([]byte, error) {
+// bumpMetadataLastModified returns raw with only its top-level
+// "lastModified" member set to now (a decimal string of milliseconds, as the
+// device stores it). Every other byte is unchanged.
+func bumpMetadataLastModified(raw []byte, now int64) ([]byte, error) {
 	if !json.Valid(raw) {
 		return nil, errors.New("metadata blob is not valid JSON")
 	}
@@ -279,11 +318,10 @@ func BumpMetadataLastModified(raw []byte, now int64) ([]byte, error) {
 	return spliceJSONMember(raw, "lastModified", value)
 }
 
-// VerifyTagSplice is the readback for a prepared .content blob: it checks,
-// independently of the offsets the splice computed, that spliced differs from
-// original in nothing but the "tags" member and that the member says what the
-// caller meant. It exists so a bug in the splice cannot reach the wire.
-func VerifyTagSplice(original, spliced []byte, wantTags []string) error {
+// verifyTagSplice is the readback for a prepared .content blob: independent
+// of the offsets the splice computed, it checks that spliced differs from
+// original in nothing but "tags", and that "tags" says what the caller meant.
+func verifyTagSplice(original, spliced []byte, wantTags []string) error {
 	var before, after map[string]json.RawMessage
 	if err := json.Unmarshal(original, &before); err != nil {
 		return fmt.Errorf("readback: original content blob does not parse: %w", err)
@@ -296,7 +334,7 @@ func VerifyTagSplice(original, spliced []byte, wantTags []string) error {
 	if err := json.Unmarshal(after["tags"], &tags); err != nil {
 		return fmt.Errorf("readback: spliced tags do not parse: %w", err)
 	}
-	if got := TagNames(tags); !stringsEqual(got, wantTags) {
+	if got := tagNames(tags); !stringsEqual(got, wantTags) {
 		return fmt.Errorf("readback: content blob has tags %v, intended %v", got, wantTags)
 	}
 
@@ -356,10 +394,8 @@ type memberSpan struct {
 }
 
 // jsonMemberSpan walks the top-level members of a JSON object with a token
-// decoder, so nested objects and arrays are skipped whole and never
-// interpreted. It refuses duplicate keys: a document that names the same
-// member twice is ambiguous, and replacing one of them would leave the other
-// to win on the device.
+// decoder, so nested objects and arrays are skipped whole. It refuses
+// duplicate keys: a document naming the same member twice is ambiguous.
 func jsonMemberSpan(raw []byte, key string) (memberSpan, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	tok, err := dec.Token()
@@ -415,8 +451,8 @@ func jsonMemberSpan(raw []byte, key string) (memberSpan, error) {
 	}
 }
 
-// valueStart skips the ':' and surrounding whitespace that follow a member
-// name ending at offset, and returns the offset where the value begins.
+// valueStart skips the ':' and surrounding whitespace after a member name
+// ending at offset, and returns the offset where the value begins.
 func valueStart(raw []byte, offset int) (int, error) {
 	i := offset
 	for i < len(raw) && isJSONSpace(raw[i]) {
@@ -492,15 +528,10 @@ func (o TagOp) String() string {
 	}
 }
 
-// ApplyTags computes the new document-tag set for an operation, and reports
-// whether it differs from what was there.
-//
-// Tags that survive an operation keep their original timestamp. That is what
-// makes a repeated write a genuine no-op: re-running the same command produces
-// an identical tag set, so changed is false and nothing is uploaded. Stamping
-// every tag with the current time would make each retry look like a change and
-// churn the document's revision.
-func ApplyTags(existing []archive.Tag, op TagOp, names []string, now int64) ([]archive.Tag, bool) {
+// applyTags computes the new document-tag set for an operation, and reports
+// whether it differs from what was there. Tags that survive an operation keep
+// their original timestamp, so a repeated write is a genuine no-op.
+func applyTags(existing []archive.Tag, op TagOp, names []string, now int64) ([]archive.Tag, bool) {
 	byName := make(map[string]archive.Tag, len(existing))
 	for _, t := range existing {
 		byName[t.Name] = t
@@ -617,11 +648,8 @@ func (d *BlobDoc) IndexReaderWithSchema(schema string) (io.Reader, error) {
 	}
 
 	// Same canonical-order requirement as the root index (see
-	// HashTree.IndexReader). Normally d.Files is already sorted, because
-	// Rehash() -> HashEntries() sorts in place — but AddFile() appends and not
-	// every write path is guaranteed to have rehashed first. Sorting here makes
-	// the emitted body canonical regardless of how we got here; it is in-place
-	// and idempotent, so it cannot disagree with HashEntries' ordering.
+	// HashTree.IndexReader): sort in place so the emitted body matches
+	// HashEntries' ordering regardless of how d.Files got here.
 	sort.Slice(d.Files, func(i, j int) bool { return d.Files[i].DocumentID < d.Files[j].DocumentID })
 
 	var w bytes.Buffer

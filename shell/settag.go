@@ -11,8 +11,8 @@ import (
 	"github.com/ogier/pflag"
 )
 
-// ParseTags parses a comma-separated tag string into a slice of non-empty trimmed tag names.
-func ParseTags(tagsStr string) []string {
+// parseTags parses a comma-separated tag string into a slice of non-empty trimmed tag names.
+func parseTags(tagsStr string) []string {
 	if strings.TrimSpace(tagsStr) == "" {
 		return []string{}
 	}
@@ -37,16 +37,17 @@ type settagArgs struct {
 
 // settagFlags holds the raw flag values parsed by newSettagFlagSet.
 type settagFlags struct {
-	add, remove, replace bool
-	ifRevision           string
+	add, remove bool
+	ifRevision  string
 }
+
+const settagUsage = "usage: settag [--add|--remove] [--if-revision=<hash>] <path> <tag1,tag2...>"
 
 func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
 	f := &settagFlags{}
 	fs := pflag.NewFlagSet("settag", pflag.ContinueOnError)
 	fs.BoolVar(&f.add, "add", false, "add the supplied tags, leaving existing ones in place")
 	fs.BoolVar(&f.remove, "remove", false, "remove the supplied tags, leaving the rest in place")
-	fs.BoolVar(&f.replace, "replace", false, "make the document's tags exactly the supplied set (default)")
 	fs.StringVar(&f.ifRevision, "if-revision", "", "only write if the document is currently at this revision hash")
 	return fs, f
 }
@@ -55,35 +56,25 @@ func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
 // does not touch the filesystem or the API, so it can be unit-tested without
 // a shell.
 func resolveSettagArgs(f *settagFlags, positional []string) (*settagArgs, error) {
-	opCount := 0
 	op := sync15.TagOpReplace
+	if f.add && f.remove {
+		return nil, errors.New("choose one of --add, --remove")
+	}
 	if f.add {
-		opCount++
 		op = sync15.TagOpAdd
 	}
 	if f.remove {
-		opCount++
 		op = sync15.TagOpRemove
 	}
-	if f.replace {
-		opCount++
-		op = sync15.TagOpReplace
-	}
-	if opCount > 1 {
-		return nil, errors.New("choose one of --add, --remove, --replace")
-	}
 
-	if len(positional) < 2 {
-		return nil, errors.New("missing path and/or tags")
+	if len(positional) != 2 {
+		return nil, errors.New(settagUsage)
 	}
-
-	path := positional[0]
-	tagsStr := strings.Join(positional[1:], " ")
 
 	return &settagArgs{
 		Op:               op,
-		Tags:             ParseTags(tagsStr),
-		Path:             path,
+		Tags:             parseTags(positional[1]),
+		Path:             positional[0],
 		ExpectedRevision: f.ifRevision,
 	}, nil
 }
@@ -100,7 +91,7 @@ func parseSettagArgs(args []string) (*settagArgs, error) {
 }
 
 func settagCmd(ctx *ShellCtxt) *ishell.Cmd {
-	longHelp := `Usage: settag [--add|--remove|--replace] [--if-revision=<hash>] <path> <tag1,tag2...>
+	longHelp := `Usage: settag [--add|--remove] [--if-revision=<hash>] <path> <tag1,tag2...>
 
 Tags are comma-separated. With no operation flag the document's tags are replaced.`
 
@@ -129,6 +120,11 @@ Tags are comma-separated. With no operation flag the document's tags are replace
 
 			if node.IsRoot() {
 				c.Err(errors.New("cannot set tags on root"))
+				return
+			}
+
+			if node.IsDirectory() {
+				c.Err(errors.New("cannot set tags on a folder"))
 				return
 			}
 

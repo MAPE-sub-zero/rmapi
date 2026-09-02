@@ -23,17 +23,9 @@ import (
 
 // --- Tag algebra: replace / add / remove, with idempotency ------------------
 
-func tagNames(tags []archive.Tag) []string {
-	out := make([]string, 0, len(tags))
-	for _, t := range tags {
-		out = append(out, t.Name)
-	}
-	return out
-}
-
 func TestApplyTagsReplaceKeepsTimestampsOfSurvivingTags(t *testing.T) {
 	existing := []archive.Tag{{Name: "ops", Timestamp: 100}, {Name: "old", Timestamp: 200}}
-	got, changed := ApplyTags(existing, TagOpReplace, []string{"ops", "new"}, 999)
+	got, changed := applyTags(existing, TagOpReplace, []string{"ops", "new"}, 999)
 	if !changed {
 		t.Fatal("replacing with a different set must report changed")
 	}
@@ -51,7 +43,7 @@ func TestApplyTagsReplaceKeepsTimestampsOfSurvivingTags(t *testing.T) {
 func TestApplyTagsIsIdempotent(t *testing.T) {
 	existing := []archive.Tag{{Name: "ops", Timestamp: 100}}
 	for _, op := range []TagOp{TagOpReplace, TagOpAdd} {
-		got, changed := ApplyTags(existing, op, []string{"ops"}, 999)
+		got, changed := applyTags(existing, op, []string{"ops"}, 999)
 		if changed {
 			t.Errorf("op %v: re-applying the same tag must report changed=false", op)
 		}
@@ -59,7 +51,7 @@ func TestApplyTagsIsIdempotent(t *testing.T) {
 			t.Errorf("op %v: timestamp must not churn on a no-op, got %d", op, got[0].Timestamp)
 		}
 	}
-	got, changed := ApplyTags(existing, TagOpRemove, []string{"absent"}, 999)
+	got, changed := applyTags(existing, TagOpRemove, []string{"absent"}, 999)
 	if changed {
 		t.Error("removing an absent tag must report changed=false")
 	}
@@ -70,7 +62,7 @@ func TestApplyTagsIsIdempotent(t *testing.T) {
 
 func TestApplyTagsAddAppendsOnlyMissing(t *testing.T) {
 	existing := []archive.Tag{{Name: "ops", Timestamp: 100}}
-	got, changed := ApplyTags(existing, TagOpAdd, []string{"ops", "review", "review"}, 999)
+	got, changed := applyTags(existing, TagOpAdd, []string{"ops", "review", "review"}, 999)
 	if !changed {
 		t.Fatal("adding a new tag must report changed")
 	}
@@ -81,7 +73,7 @@ func TestApplyTagsAddAppendsOnlyMissing(t *testing.T) {
 
 func TestApplyTagsRemoveDropsOnlyNamed(t *testing.T) {
 	existing := []archive.Tag{{Name: "ops", Timestamp: 100}, {Name: "review", Timestamp: 200}}
-	got, changed := ApplyTags(existing, TagOpRemove, []string{"review"}, 999)
+	got, changed := applyTags(existing, TagOpRemove, []string{"review"}, 999)
 	if !changed {
 		t.Fatal("removing a present tag must report changed")
 	}
@@ -206,34 +198,51 @@ func loadPreservationDoc(t *testing.T) *BlobDoc {
 	return doc
 }
 
-func planOn(t *testing.T, doc *BlobDoc, op TagOp, names []string, expected string) (*TagUpdatePlan, error) {
+func planOn(t *testing.T, doc *BlobDoc, op TagOp, names []string, expected string) (*tagUpdatePlan, error) {
 	t.Helper()
-	return PlanTagUpdate(doc, []byte(preservationContent), []byte(preservationMetadata), op, names, expected, 42)
+	return planTagUpdate(doc, []byte(preservationContent), []byte(preservationMetadata), op, names, expected, 42)
 }
 
 // --- Write-path preservation (the RMAPI-SETTAG-001 "never destroy ink" rule) ---
 
 func TestTagWritePreservesEveryOtherKeyInContentAndMetadata(t *testing.T) {
-	doc := loadPreservationDoc(t)
+	var compacted bytes.Buffer
+	require.NoError(t, json.Compact(&compacted, []byte(preservationContent)))
 
-	plan, err := planOn(t, doc, TagOpAdd, []string{"reviewed"}, "")
-	require.NoError(t, err)
-	require.True(t, plan.Result.Changed)
+	cases := []struct {
+		name    string
+		content []byte
+		tag     string
+	}{
+		{"pretty-printed fixture", []byte(preservationContent), "reviewed"},
+		{"compacted fixture", compacted.Bytes(), "reviewed"},
+		{"non-ASCII tag name", []byte(preservationContent), "réunion·2026"},
+		{"tag name with an embedded quote", []byte(preservationContent), `a"b`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := loadPreservationDoc(t)
+			plan, err := planTagUpdate(doc, tc.content, []byte(preservationMetadata), TagOpAdd, []string{tc.tag}, "", 42)
+			require.NoError(t, err)
+			require.True(t, plan.Result.Changed)
+			require.True(t, json.Valid(plan.Content), "spliced content must still parse")
 
-	// .content: only "tags" may differ, and it must say what we meant.
-	assert.Equal(t,
-		topLevelWithout(t, []byte(preservationContent), "tags"),
-		topLevelWithout(t, plan.Content, "tags"),
-		".content: a tag write changed something other than tags")
-	assert.Equal(t, []string{"ops", "reviewed"}, TagNames(contentTags(t, plan.Content)))
+			// .content: only "tags" may differ, and it must say what we meant.
+			assert.Equal(t,
+				topLevelWithout(t, tc.content, "tags"),
+				topLevelWithout(t, plan.Content, "tags"),
+				".content: a tag write changed something other than tags")
+			assert.Contains(t, tagNames(contentTags(t, plan.Content)), tc.tag)
 
-	// .metadata: only "lastModified" may differ (Matt, 2026-09-01: a tag write
-	// bumps lastModified the way the official app does).
-	assert.Equal(t,
-		topLevelWithout(t, []byte(preservationMetadata), "lastModified"),
-		topLevelWithout(t, plan.Metadata, "lastModified"),
-		".metadata: a tag write changed something other than lastModified")
-	assert.Equal(t, `"42"`, string(topLevelWithout(t, plan.Metadata, "")["lastModified"]))
+			// .metadata: only "lastModified" may differ (Matt, 2026-09-01: a
+			// tag write bumps lastModified the way the official app does).
+			assert.Equal(t,
+				topLevelWithout(t, []byte(preservationMetadata), "lastModified"),
+				topLevelWithout(t, plan.Metadata, "lastModified"),
+				".metadata: a tag write changed something other than lastModified")
+			assert.Equal(t, `"42"`, string(topLevelWithout(t, plan.Metadata, "")["lastModified"]))
+		})
+	}
 }
 
 func TestTagWriteIsByteIdenticalOutsideTheSplicedMember(t *testing.T) {
@@ -264,12 +273,12 @@ func TestTagWriteKeepsSurvivingTagBytesVerbatim(t *testing.T) {
 	// A surviving tag may carry fields this rmapi does not model. They ride
 	// through untouched, as do the survivor's original timestamp and spacing.
 	raw := []byte(`{"tags":[{"name":"ops","timestamp":1, "colour":"red"},{"name":"old","timestamp":2}],"pageTags":[]}`)
-	got, err := ReplaceContentTags(raw, TagOpReplace, []string{"ops", "new"}, 42)
+	got, err := replaceContentTags(raw, TagOpReplace, []string{"ops", "new"}, 42)
 	require.NoError(t, err)
 	require.True(t, got.Changed)
 	assert.Contains(t, string(got.Bytes), `{"name":"ops","timestamp":1, "colour":"red"}`)
 	assert.NotContains(t, string(got.Bytes), `"old"`)
-	assert.Equal(t, []string{"ops", "new"}, TagNames(contentTags(t, got.Bytes)))
+	assert.Equal(t, []string{"ops", "new"}, tagNames(contentTags(t, got.Bytes)))
 	assert.Equal(t, int64(42), contentTags(t, got.Bytes)[1].Timestamp)
 }
 
@@ -289,10 +298,10 @@ func TestTagWriteAddsTheMemberWhenTheDocumentHasNone(t *testing.T) {
 	// Older documents have no "tags" member at all; the write must add one and
 	// nothing else. Both an empty object and a populated one.
 	for _, raw := range []string{`{}`, `{ }`, `{"fileType":"pdf","pageTags":[]}`, "{\n  \"fileType\": \"pdf\"\n}"} {
-		got, err := ReplaceContentTags([]byte(raw), TagOpAdd, []string{"x"}, 7)
+		got, err := replaceContentTags([]byte(raw), TagOpAdd, []string{"x"}, 7)
 		require.NoError(t, err, raw)
 		require.True(t, got.Changed, raw)
-		assert.Equal(t, []string{"x"}, TagNames(contentTags(t, got.Bytes)), raw)
+		assert.Equal(t, []string{"x"}, tagNames(contentTags(t, got.Bytes)), raw)
 		assert.Equal(t,
 			topLevelWithout(t, []byte(raw), "tags"),
 			topLevelWithout(t, got.Bytes, "tags"), raw)
@@ -310,12 +319,12 @@ func TestTagWriteFailsClosedOnUnparseableInput(t *testing.T) {
 		"pageTags scalar": `{"tags":[],"pageTags":3}`,
 	}
 	for name, raw := range cases {
-		_, err := ReplaceContentTags([]byte(raw), TagOpAdd, []string{"x"}, 7)
+		_, err := replaceContentTags([]byte(raw), TagOpAdd, []string{"x"}, 7)
 		assert.Error(t, err, name)
 	}
-	_, err := BumpMetadataLastModified([]byte(`{"lastModified":"1"`), 7)
+	_, err := bumpMetadataLastModified([]byte(`{"lastModified":"1"`), 7)
 	assert.Error(t, err, "truncated metadata")
-	_, err = BumpMetadataLastModified([]byte(`{"lastModified":"1","lastModified":"2"}`), 7)
+	_, err = bumpMetadataLastModified([]byte(`{"lastModified":"1","lastModified":"2"}`), 7)
 	assert.Error(t, err, "duplicate lastModified")
 }
 
@@ -365,9 +374,9 @@ func TestSpliceJSONMemberRefusesAmbiguousOrInvalidInput(t *testing.T) {
 // --- Readback ---------------------------------------------------------------
 
 func TestVerifyTagSpliceAcceptsAFaithfulSplice(t *testing.T) {
-	got, err := ReplaceContentTags([]byte(preservationContent), TagOpAdd, []string{"reviewed"}, 42)
+	got, err := replaceContentTags([]byte(preservationContent), TagOpAdd, []string{"reviewed"}, 42)
 	require.NoError(t, err)
-	assert.NoError(t, VerifyTagSplice([]byte(preservationContent), got.Bytes, []string{"ops", "reviewed"}))
+	assert.NoError(t, verifyTagSplice([]byte(preservationContent), got.Bytes, []string{"ops", "reviewed"}))
 }
 
 func TestVerifyTagSpliceRejectsCollateralChange(t *testing.T) {
@@ -381,7 +390,7 @@ func TestVerifyTagSpliceRejectsCollateralChange(t *testing.T) {
 		"not json":                `{"a":1,`,
 	}
 	for name, spliced := range cases {
-		assert.Error(t, VerifyTagSplice(original, []byte(spliced), []string{"x"}), name)
+		assert.Error(t, verifyTagSplice(original, []byte(spliced), []string{"x"}), name)
 	}
 }
 
@@ -449,18 +458,21 @@ func TestPlanTagUpdateReportsBeforeAndAfterState(t *testing.T) {
 	assert.Equal(t, "ffff", r.BeforeRevision)
 	assert.NotEmpty(t, r.AfterRevision)
 	assert.NotEqual(t, r.BeforeRevision, r.AfterRevision, "AfterRevision must be recomputed")
-	assert.Equal(t, doc.Hash, r.AfterRevision)
+	assert.Equal(t, "ffff", doc.Hash, "planTagUpdate must not mutate the document")
+	assert.Equal(t, plan.docHash, r.AfterRevision)
 	assert.Equal(t, 1, r.PageTagCount)
 
 	// The hashes in the report are the hashes of the bytes that will be sent,
-	// and the tree entries now point at them with the right sizes. The .rm
-	// entry is untouched: ink is never rewritten.
-	assert.Equal(t, doc.Files[0].Hash, r.ContentHash)
-	assert.Equal(t, doc.Files[1].Hash, r.MetadataHash)
-	assert.Equal(t, int64(len(plan.Content)), doc.Files[0].Size)
-	assert.Equal(t, int64(len(plan.Metadata)), doc.Files[1].Size)
-	assert.Equal(t, "0b0b", doc.Files[2].Hash)
-	assert.Equal(t, int64(4096), doc.Files[2].Size)
+	// and the plan's copied files point at them with the right sizes. The
+	// document's own entries, and the .rm entry, are untouched.
+	assert.Equal(t, plan.files[0].Hash, r.ContentHash)
+	assert.Equal(t, plan.files[1].Hash, r.MetadataHash)
+	assert.Equal(t, int64(len(plan.Content)), plan.files[0].Size)
+	assert.Equal(t, int64(len(plan.Metadata)), plan.files[1].Size)
+	assert.Equal(t, "0b0b", plan.files[2].Hash)
+	assert.Equal(t, int64(4096), plan.files[2].Size)
+	assert.Equal(t, "c0c0", doc.Files[0].Hash, "document's own files entry must be untouched")
+	assert.Equal(t, "0a0a", doc.Files[1].Hash, "document's own files entry must be untouched")
 }
 
 func TestPlanTagUpdateDoesNotDependOnTheParsedStructs(t *testing.T) {
@@ -472,6 +484,28 @@ func TestPlanTagUpdateDoesNotDependOnTheParsedStructs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"ops", "review"}, plan.Result.AfterTags)
 	assert.NotContains(t, string(plan.Content), "struct-only")
+}
+
+func TestPlanTagUpdateDoesNotMutateTheDocument(t *testing.T) {
+	doc := loadPreservationDoc(t)
+	before, err := json.Marshal(doc)
+	require.NoError(t, err)
+
+	plan, err := planOn(t, doc, TagOpAdd, []string{"review"}, "")
+	require.NoError(t, err)
+	require.True(t, plan.Result.Changed)
+
+	after, err := json.Marshal(doc)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after), "planTagUpdate must not mutate the document")
+
+	plan.apply(doc)
+	assert.Equal(t, plan.docHash, doc.Hash)
+	assert.Equal(t, plan.docSize, doc.Size)
+	assert.Equal(t, plan.Result.ContentHash, doc.Files[0].Hash)
+	assert.Equal(t, plan.Result.MetadataHash, doc.Files[1].Hash)
+	assert.Equal(t, []string{"ops", "review"}, tagNames(doc.Content.DocumentTags))
+	assert.Equal(t, plan.lastModified, doc.Metadata.LastModified)
 }
 
 // --- End to end against a fake sync15 cloud --------------------------------
@@ -489,7 +523,11 @@ type fakeCloud struct {
 	gen      int64
 	putBlobs []string // hashes PUT, in order
 	rootPuts int
-	dropPuts bool // accept blob PUTs but store nothing (simulates a lost write)
+
+	dropPuts       bool   // accept blob PUTs but store nothing (simulates a lost write)
+	failBlobPuts   bool   // blob PUTs return 500 (simulates an upload that never reaches the server)
+	alwaysConflict bool   // root PUTs always 412, regardless of generation
+	afterRootPut   func() // run synchronously after a successful root PUT, lock released
 }
 
 func (c *fakeCloud) handler() http.Handler {
@@ -501,20 +539,32 @@ func (c *fakeCloud) handler() http.Handler {
 	})
 	mux.HandleFunc("/sync/v3/root", func(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		c.rootPuts++
+		if c.alwaysConflict {
+			c.mu.Unlock()
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
 		var req model.BlobRootStorageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			c.mu.Unlock()
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		if req.Generation != c.gen {
+			c.mu.Unlock()
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
 		c.rootHash = req.Hash
 		c.gen++
-		json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen})
+		resp := model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen}
+		hook := c.afterRootPut
+		c.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/sync/v3/files/", func(w http.ResponseWriter, r *http.Request) {
 		hash := strings.TrimPrefix(r.URL.Path, "/sync/v3/files/")
@@ -529,6 +579,10 @@ func (c *fakeCloud) handler() http.Handler {
 			}
 			w.Write(b)
 		case http.MethodPut:
+			if c.failBlobPuts {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			b, _ := io.ReadAll(r.Body)
 			c.putBlobs = append(c.putBlobs, hash)
 			if !c.dropPuts {
@@ -628,7 +682,7 @@ func TestUpdateDocumentTagsWritesOnlyTheTwoBlobsAndTheIndexes(t *testing.T) {
 	assert.Equal(t,
 		topLevelWithout(t, []byte(preservationContent), "tags"),
 		topLevelWithout(t, stored, "tags"))
-	assert.Equal(t, []string{"ops", "reviewed"}, TagNames(contentTags(t, stored)))
+	assert.Equal(t, []string{"ops", "reviewed"}, tagNames(contentTags(t, stored)))
 	assert.Equal(t,
 		topLevelWithout(t, []byte(preservationMetadata), "lastModified"),
 		topLevelWithout(t, cloud.blobs[res.MetadataHash], "lastModified"))
@@ -720,7 +774,7 @@ func TestUpdateDocumentTagsWithoutPreconditionReappliesOnTheFreshTree(t *testing
 	assert.Equal(t, []string{"theirs"}, res.BeforeTags)
 	assert.Equal(t, []string{"theirs", "mine"}, res.AfterTags)
 	assert.Equal(t, 2, cloud.rootPuts, "refused once, then written")
-	assert.Equal(t, []string{"theirs", "mine"}, TagNames(contentTags(t, cloud.blobs[res.ContentHash])))
+	assert.Equal(t, []string{"theirs", "mine"}, tagNames(contentTags(t, cloud.blobs[res.ContentHash])))
 }
 
 func TestUpdateDocumentTagsFailsWhenTheReadbackDoesNotMatch(t *testing.T) {
@@ -736,4 +790,101 @@ func TestUpdateDocumentTagsFailsWhenTheReadbackDoesNotMatch(t *testing.T) {
 	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "readback")
+}
+
+func TestUpdateDocumentTagsLeavesTheTreeUntouchedWhenAnUploadFails(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore := cloud.rootHash
+
+	before, err := json.Marshal(ctx.hashTree)
+	require.NoError(t, err)
+
+	cloud.failBlobPuts = true
+	_, err = ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+
+	after, err := json.Marshal(ctx.hashTree)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after), "tree must be untouched after a failed upload")
+	assert.Equal(t, rootBefore, cloud.rootHash, "cloud root must be untouched after a failed upload")
+
+	cloud.failBlobPuts = false
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	assert.True(t, res.Changed)
+}
+
+func TestUpdateDocumentTagsFailsWhenTheServerNeverAcceptsTheRoot(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore := cloud.rootHash
+
+	cloud.alwaysConflict = true
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not committed")
+	assert.Equal(t, rootBefore, cloud.rootHash, "cloud root must be untouched")
+}
+
+func TestUpdateDocumentTagsReadbackChecksTheServerNotTheCache(t *testing.T) {
+	// A concurrent writer lands its own root write in the instant between our
+	// root PUT succeeding and the readback that follows. The readback must
+	// see their root, not the hash our own Sync call believed it wrote.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	cloud.afterRootPut = func() {
+		cloud.mu.Lock()
+		cloud.rootHash = rootBefore
+		cloud.gen = genBefore
+		cloud.mu.Unlock()
+	}
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not committed")
+}
+
+func TestUpdateDocumentTagsRefreshesTheCachedDocument(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	require.True(t, res.Changed)
+
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, res.AfterTags, d.ToDocument().Tags)
+
+	var meta struct {
+		LastModified string `json:"lastModified"`
+	}
+	require.NoError(t, json.Unmarshal(cloud.blobs[res.MetadataHash], &meta))
+	assert.Equal(t, meta.LastModified, d.Metadata.LastModified)
+
+	var wantSize int64
+	for _, f := range d.Files {
+		wantSize += f.Size
+	}
+	assert.Equal(t, wantSize, d.Size)
+
+	// What saveTree persists still shows the new tags after a round trip.
+	raw, err := json.Marshal(ctx.hashTree)
+	require.NoError(t, err)
+	var reloaded HashTree
+	require.NoError(t, json.Unmarshal(raw, &reloaded))
+	rd, err := reloaded.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, res.AfterTags, rd.ToDocument().Tags)
 }

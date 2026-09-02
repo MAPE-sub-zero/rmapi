@@ -61,7 +61,7 @@ func TestParseTags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ParseTags(tt.input)
+			result := parseTags(tt.input)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -98,15 +98,6 @@ func TestParseSettagArgs(t *testing.T) {
 			args: []string{"--remove", "test-note", "inbox"},
 			want: &settagArgs{
 				Op:   sync15.TagOpRemove,
-				Tags: []string{"inbox"},
-				Path: "test-note",
-			},
-		},
-		{
-			name: "--replace sets TagOpReplace explicitly",
-			args: []string{"--replace", "test-note", "inbox"},
-			want: &settagArgs{
-				Op:   sync15.TagOpReplace,
 				Tags: []string{"inbox"},
 				Path: "test-note",
 			},
@@ -162,12 +153,12 @@ func TestParseSettagArgs(t *testing.T) {
 		{
 			name:    "two op flags is an error",
 			args:    []string{"--add", "--remove", "test-note", "inbox"},
-			wantErr: "choose one of --add, --remove, --replace",
+			wantErr: "choose one of --add, --remove",
 		},
 		{
-			name:    "--replace combined with --add is also an error",
-			args:    []string{"--replace", "--add", "test-note", "inbox"},
-			wantErr: "choose one of --add, --remove, --replace",
+			name:    "--replace is not a flag anymore; replace is the default",
+			args:    []string{"--replace", "test-note", "inbox"},
+			wantErr: "unknown flag: --replace",
 		},
 		{
 			name:    "--if-revision with no value is an error",
@@ -177,12 +168,17 @@ func TestParseSettagArgs(t *testing.T) {
 		{
 			name:    "missing path and tags",
 			args:    []string{},
-			wantErr: "missing path and/or tags",
+			wantErr: settagUsage,
 		},
 		{
 			name:    "missing tags",
 			args:    []string{"test-note"},
-			wantErr: "missing path and/or tags",
+			wantErr: settagUsage,
+		},
+		{
+			name:    "too many positional arguments; tags are not joined",
+			args:    []string{"test-note", "a", "b"},
+			wantErr: settagUsage,
 		},
 		{
 			name:    "--json is not a settag flag; JSON output is chosen globally",
@@ -274,6 +270,11 @@ func newSettagTestFixture() (*filetree.FileTreeCtx, *mockApiCtx, *api.UserInfo) 
 		Name: "test-note",
 		Type: model.DocumentType,
 	})
+	ft.AddDocument(&model.Document{
+		ID:   "folder-uuid-456",
+		Name: "a-folder",
+		Type: model.DirectoryType,
+	})
 	ft.FinishAdd()
 
 	mock := &mockApiCtx{
@@ -362,4 +363,14 @@ func TestSettagCommandJSONOutput(t *testing.T) {
 
 	require.True(t, mock.called)
 	assert.True(t, mock.syncCompleteCalled)
+}
+
+func TestSettagCommandRefusesAFolder(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+
+	err := RunShell(mock, userInfo, []string{"settag", "a-folder", "inbox"}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot set tags on a folder")
+
+	assert.False(t, mock.called, "the API must not be called for a folder")
 }
