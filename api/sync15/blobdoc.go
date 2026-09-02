@@ -139,9 +139,11 @@ func tagNames(tags []archive.Tag) []string {
 //
 // remoteFiles is the document's file list as read from the server at doc's
 // current hash, not doc.Files: sizes and membership come from what the
-// server holds, not a possibly-stale cache. Every entry other than the two
-// files this write may touch (.content, .metadata) survives byte-identical —
-// see assertBaseContainment.
+// server holds, not a possibly-stale cache. files is built by deep-copying
+// remoteFiles and mutating only the two entries this write may touch
+// (.content, .metadata) via setEntryBlob, so every other entry survives
+// byte-identical by construction — there is no separate containment check
+// to pass.
 //
 // rawContent/rawMetadata are the raw blobs as stored, not the parsed
 // archive.Content / archive.MetadataFile: those structs model only part of
@@ -213,10 +215,6 @@ func planTagUpdate(doc *BlobDoc, remoteFiles []*Entry, rawContent, rawMetadata [
 		return nil, err
 	}
 
-	if err := assertBaseContainment(files, remoteFiles, doc.DocumentID); err != nil {
-		return nil, err
-	}
-
 	docHash, err := HashEntries(files)
 	if err != nil {
 		return nil, err
@@ -241,36 +239,6 @@ func planTagUpdate(doc *BlobDoc, remoteFiles []*Entry, rawContent, rawMetadata [
 		tags:         content.AfterTagSet,
 		lastModified: strconv.FormatInt(now, 10),
 	}, nil
-}
-
-// assertBaseContainment is the load-bearing half of "never destroy ink": a
-// tag write may change only .content and .metadata. It checks that files (the
-// plan's copy) preserves every other entry of base byte-identical, with
-// exactly the same membership.
-func assertBaseContainment(files, base []*Entry, docID string) error {
-	contentName := addExt(docID, archive.ContentExt)
-	metadataName := addExt(docID, archive.MetadataExt)
-
-	if len(files) != len(base) {
-		return fmt.Errorf("document %s: plan has %d files, base list has %d", docID, len(files), len(base))
-	}
-	byName := make(map[string]*Entry, len(files))
-	for _, f := range files {
-		byName[f.DocumentID] = f
-	}
-	for _, b := range base {
-		if b.DocumentID == contentName || b.DocumentID == metadataName {
-			continue
-		}
-		f, ok := byName[b.DocumentID]
-		if !ok {
-			return fmt.Errorf("document %s: plan is missing %s", docID, b.DocumentID)
-		}
-		if *f != *b {
-			return fmt.Errorf("document %s: plan changed %s, which a tag write must not touch", docID, b.DocumentID)
-		}
-	}
-	return nil
 }
 
 // indexReader returns the doc-index body for the plan's files.
@@ -608,6 +576,44 @@ func verifyTagSplice(original, spliced []byte, wantTags []string) error {
 		}
 		if !bytes.Equal(v, w) {
 			return fmt.Errorf("readback: content blob changed member %q", k)
+		}
+	}
+	return nil
+}
+
+// verifyMetadataSplice is verifyTagSplice's counterpart for .metadata: an
+// independent readback proving spliced differs from original in nothing but
+// "lastModified", and that lastModified now reads as the decimal string form
+// of now.
+func verifyMetadataSplice(original, spliced []byte, now int64) error {
+	var before, after map[string]json.RawMessage
+	if err := json.Unmarshal(original, &before); err != nil {
+		return fmt.Errorf("readback: original metadata blob does not parse: %w", err)
+	}
+	if err := json.Unmarshal(spliced, &after); err != nil {
+		return fmt.Errorf("readback: spliced metadata blob does not parse: %w", err)
+	}
+
+	var lastModified string
+	if err := json.Unmarshal(after["lastModified"], &lastModified); err != nil {
+		return fmt.Errorf("readback: spliced lastModified does not parse: %w", err)
+	}
+	if want := strconv.FormatInt(now, 10); lastModified != want {
+		return fmt.Errorf("readback: metadata blob has lastModified %q, intended %q", lastModified, want)
+	}
+
+	delete(before, "lastModified")
+	delete(after, "lastModified")
+	if len(before) != len(after) {
+		return fmt.Errorf("readback: metadata blob has %d members outside lastModified, original had %d", len(after), len(before))
+	}
+	for k, v := range before {
+		w, ok := after[k]
+		if !ok {
+			return fmt.Errorf("readback: metadata blob lost member %q", k)
+		}
+		if !bytes.Equal(v, w) {
+			return fmt.Errorf("readback: metadata blob changed member %q", k)
 		}
 	}
 	return nil

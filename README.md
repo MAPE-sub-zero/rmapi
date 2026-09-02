@@ -287,14 +287,24 @@ Use `stat entry` to dump its metadata as reported by the Cloud API.
 
 ## Setting tags
 
-Use `settag path tag1,tag2` to set a document's tags. `--add` and `--remove` change only the named tags; without a flag the tag set is replaced. `--if-revision=<hash>` refuses the write if the document has changed since you read that hash. The global `--json` flag prints the before/after result as JSON.
+Use `settag path tag1,tag2` to set a document's tags. `--add` and `--remove` change only the named tags; without a flag the tag set is replaced. An empty tag list is refused outright — use `--remove <tag,...>` to drop specific tags instead of clearing all of them. Tags are comma-separated, and a tag name cannot itself contain a comma (there is no escape for it).
+
+`--if-revision=<hash>` refuses the write if the document has changed since you read that hash. `settag --show path` is where that hash comes from: it prints the document's current revision and tags, and cannot be combined with `--add`, `--remove`, or `--if-revision`. The global `--json` flag prints the before/after result as JSON, including `afterRevision` — the value to pass to a later `--if-revision`.
 
 ```
 settag notes/todo inbox,urgent
 settag --add notes/todo reviewed
 settag --remove notes/todo inbox
+settag --show notes/todo
 rmapi --json settag --if-revision=<hash> notes/todo inbox
 ```
+
+On failure, `--json` also prints a structured error object with a `kind` field:
+
+- `stale_revision` — `--if-revision` named a hash the document is no longer at.
+- `superseded` — the write landed, then a later writer replaced the document's revision.
+- `not_committed` — the write never reached the server at all.
+- `error` — anything else (a failed upload, a readback that could not verify the bytes it wrote, and so on).
 
 # Run command non-interactively
 

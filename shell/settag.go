@@ -8,6 +8,7 @@ import (
 
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/api/sync15"
+	"github.com/juruen/rmapi/model"
 	"github.com/ogier/pflag"
 )
 
@@ -84,15 +85,17 @@ type settagArgs struct {
 	Tags             []string
 	Path             string
 	ExpectedRevision string
+	Show             bool
 }
 
 // settagFlags holds the raw flag values parsed by newSettagFlagSet.
 type settagFlags struct {
-	add, remove bool
-	ifRevision  string
+	add, remove, show bool
+	ifRevision        string
 }
 
 const settagUsage = "usage: settag [--add|--remove] [--if-revision=<hash>] <path> <tag1,tag2...>"
+const settagShowUsage = "usage: settag --show <path>"
 
 func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
 	f := &settagFlags{}
@@ -100,6 +103,7 @@ func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
 	fs.BoolVar(&f.add, "add", false, "add the supplied tags, leaving existing ones in place")
 	fs.BoolVar(&f.remove, "remove", false, "remove the supplied tags, leaving the rest in place")
 	fs.StringVar(&f.ifRevision, "if-revision", "", "only write if the document is currently at this revision hash")
+	fs.BoolVar(&f.show, "show", false, "print the document's current revision and tags, then exit")
 	return fs, f
 }
 
@@ -107,6 +111,16 @@ func newSettagFlagSet() (*pflag.FlagSet, *settagFlags) {
 // does not touch the filesystem or the API, so it can be unit-tested without
 // a shell.
 func resolveSettagArgs(f *settagFlags, positional []string) (*settagArgs, error) {
+	if f.show {
+		if f.add || f.remove || f.ifRevision != "" {
+			return nil, errors.New("--show cannot be combined with --add, --remove, or --if-revision")
+		}
+		if len(positional) != 1 {
+			return nil, errors.New(settagShowUsage)
+		}
+		return &settagArgs{Show: true, Path: positional[0]}, nil
+	}
+
 	op := sync15.TagOpReplace
 	if f.add && f.remove {
 		return nil, errors.New("choose one of --add, --remove")
@@ -122,9 +136,19 @@ func resolveSettagArgs(f *settagFlags, positional []string) (*settagArgs, error)
 		return nil, errors.New(settagUsage)
 	}
 
+	tags := parseTags(positional[1])
+	if len(tags) == 0 {
+		if op == sync15.TagOpReplace {
+			return nil, errors.New("refusing to clear every tag: an empty tag list would wipe the document's tags; use --remove <tag,...> to drop specific tags")
+		}
+		// Adding or removing zero tags has no clear meaning either; treated
+		// as a malformed invocation rather than a silent no-op.
+		return nil, errors.New(settagUsage)
+	}
+
 	return &settagArgs{
 		Op:               op,
-		Tags:             parseTags(positional[1]),
+		Tags:             tags,
 		Path:             positional[0],
 		ExpectedRevision: f.ifRevision,
 	}, nil
@@ -141,10 +165,53 @@ func parseSettagArgs(args []string) (*settagArgs, error) {
 	return resolveSettagArgs(f, fs.Args())
 }
 
+// settagShowOutput is the JSON body `settag --show` prints.
+type settagShowOutput struct {
+	DocumentID string   `json:"documentId"`
+	Revision   string   `json:"revision"`
+	Tags       []string `json:"tags"`
+}
+
+// printSettagShow prints node's current revision (the value to later pass
+// to --if-revision) and tags, in whichever of JSON or text mode ctx selects.
+func printSettagShow(c *ishell.Context, ctx *ShellCtxt, node *model.Node) {
+	revision, err := ctx.api.DocumentRevision(node.Document.ID)
+	if err != nil {
+		c.Err(fmt.Errorf("failed to read revision: %w", err))
+		return
+	}
+	tags := node.Document.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+
+	if ctx.JSONOutput {
+		out, err := json.MarshalIndent(settagShowOutput{
+			DocumentID: node.Document.ID,
+			Revision:   revision,
+			Tags:       tags,
+		}, "", "  ")
+		if err != nil {
+			c.Err(fmt.Errorf("failed to marshal result: %w", err))
+			return
+		}
+		c.Println(string(out))
+		return
+	}
+	c.Printf("revision: %s\n", revision)
+	c.Printf("tags: [%s]\n", strings.Join(tags, ", "))
+}
+
 func settagCmd(ctx *ShellCtxt) *ishell.Cmd {
 	longHelp := `Usage: settag [--add|--remove] [--if-revision=<hash>] <path> <tag1,tag2...>
+       settag --show <path>
 
-Tags are comma-separated. With no operation flag the document's tags are replaced.`
+Tags are comma-separated; a tag name cannot itself contain a comma (there is
+no escape for it). With no operation flag the document's tags are replaced.
+An empty tag list is refused outright -- use --remove <tag,...> to drop
+specific tags instead of clearing all of them. --show prints the document's
+current revision (the value to pass to a later --if-revision) and its tags,
+and cannot be combined with --add, --remove, or --if-revision.`
 
 	return &ishell.Cmd{
 		Name:      "settag",
@@ -176,6 +243,11 @@ Tags are comma-separated. With no operation flag the document's tags are replace
 
 			if node.IsDirectory() {
 				c.Err(errors.New("cannot set tags on a folder"))
+				return
+			}
+
+			if args.Show {
+				printSettagShow(c, ctx, node)
 				return
 			}
 

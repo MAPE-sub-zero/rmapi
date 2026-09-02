@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/juruen/rmapi/archive"
 	"github.com/juruen/rmapi/config"
@@ -481,6 +482,28 @@ func TestVerifyTagSpliceRejectsCollateralChange(t *testing.T) {
 	}
 }
 
+// --- verifyMetadataSplice: an independent readback for .metadata (round 4, item F)
+
+func TestVerifyMetadataSpliceAcceptsAFaithfulSplice(t *testing.T) {
+	spliced, err := bumpMetadataLastModified([]byte(preservationMetadata), 42)
+	require.NoError(t, err)
+	assert.NoError(t, verifyMetadataSplice([]byte(preservationMetadata), spliced, 42))
+}
+
+func TestVerifyMetadataSpliceRejectsCollateralChange(t *testing.T) {
+	original := []byte(`{"a":1,"visibleName":"before","lastModified":"1"}`)
+	cases := map[string]string{
+		"lastModified not the intended value": `{"a":1,"visibleName":"before","lastModified":"999"}`,
+		"member changed":                      `{"a":1,"visibleName":"after","lastModified":"42"}`,
+		"member lost":                         `{"a":1,"lastModified":"42"}`,
+		"member invented":                     `{"a":1,"b":0,"visibleName":"before","lastModified":"42"}`,
+		"not json":                            `{"a":1,`,
+	}
+	for name, spliced := range cases {
+		assert.Error(t, verifyMetadataSplice(original, []byte(spliced), 42), name)
+	}
+}
+
 // --- Stale-revision precondition, no-op detection, structured result -------
 
 func TestPlanTagUpdateRejectsAStaleRevision(t *testing.T) {
@@ -609,6 +632,7 @@ type fakeCloud struct {
 	rootHash        string
 	gen             int64
 	putBlobs        []string // hashes PUT, in order
+	putNames        []string // rm-filename header PUT, parallel to putBlobs
 	rootPuts        int
 	blobPutAttempts int // every blob PUT request received, successful or not
 
@@ -616,7 +640,16 @@ type fakeCloud struct {
 	failBlobPutN    int    // fail the Nth blob PUT (1-based) with a 500; 0 = never
 	alwaysConflict  bool   // root PUTs always 412, regardless of generation
 	failRootPutOnce bool   // the next root PUT returns 500 (a genuine, non-412 failure), then clears itself
+	rootPutAckLost  bool   // the next root PUT lands (state updates) but the response is a 500 anyway
 	afterRootPut    func() // run synchronously after a successful root PUT, lock released
+
+	// staleReadsRemaining makes GetRootIndex report staleRootHash/staleGen
+	// (a snapshot a caller supplies, typically the pre-write state) instead
+	// of the live root, this many more times, then falls back to live
+	// reads -- simulating a read replica that lags the write path.
+	staleReadsRemaining int
+	staleRootHash       string
+	staleGen            int64
 }
 
 func (c *fakeCloud) handler() http.Handler {
@@ -624,6 +657,11 @@ func (c *fakeCloud) handler() http.Handler {
 	mux.HandleFunc("/sync/v4/root", func(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if c.staleReadsRemaining > 0 {
+			c.staleReadsRemaining--
+			json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: c.staleRootHash, Generation: c.staleGen, Schema: 4})
+			return
+		}
 		json.NewEncoder(w).Encode(model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen, Schema: 4})
 	})
 	mux.HandleFunc("/sync/v3/root", func(w http.ResponseWriter, r *http.Request) {
@@ -653,6 +691,14 @@ func (c *fakeCloud) handler() http.Handler {
 		}
 		c.rootHash = req.Hash
 		c.gen++
+		if c.rootPutAckLost {
+			// The write lands (state above is already updated) but the
+			// response never usably reaches the caller.
+			c.rootPutAckLost = false
+			c.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		resp := model.BlobRootStorageResponse{Hash: c.rootHash, Generation: c.gen}
 		hook := c.afterRootPut
 		c.mu.Unlock()
@@ -681,6 +727,7 @@ func (c *fakeCloud) handler() http.Handler {
 			}
 			b, _ := io.ReadAll(r.Body)
 			c.putBlobs = append(c.putBlobs, hash)
+			c.putNames = append(c.putNames, r.Header.Get(transport.RmFileNameHeader))
 			if !c.dropPuts {
 				c.blobs[hash] = b
 			}
@@ -810,10 +857,10 @@ func TestUpdateDocumentTagsNoOpWritesNothing(t *testing.T) {
 	assert.Equal(t, genBefore, cloud.gen)
 }
 
-func TestUpdateDocumentTagsNoOpErrorsWhenLocalCacheDisagreesWithServerRoot(t *testing.T) {
-	// Round 3, item C: a no-op is a claim about the server's state, not just
-	// the local cache's. If the cache is stale, "nothing to do" would be a
-	// lie — the call must fail instead of returning a silent nil.
+func TestUpdateDocumentTagsNoOpSucceedsAfterRefreshWhenLocalCacheWasStale(t *testing.T) {
+	// Round 4, item A: the closure now refreshes a stale local root before
+	// doing anything else, so a no-op call whose cache merely lagged the
+	// server succeeds cleanly instead of refusing to report a no-op.
 	cloud, ctx := newFakeCloudCtx(t)
 	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
 	cloud.setRoot(t, doc)
@@ -824,10 +871,13 @@ func TestUpdateDocumentTagsNoOpErrorsWhenLocalCacheDisagreesWithServerRoot(t *te
 	// tags are unaffected and this call would otherwise be a genuine no-op.
 	other := cloud.seedDoc(t, "doc-2", `{}`, `{"type":"CollectionType","visibleName":"F","parent":"","lastModified":"1"}`)
 	cloud.setRoot(t, doc, other)
+	rootPutsBefore := cloud.rootPuts
 
-	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"ops"}, "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "does not match the server root")
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"ops"}, "")
+	require.NoError(t, err)
+	assert.False(t, res.Changed)
+	assert.Equal(t, rootPutsBefore, cloud.rootPuts, "a no-op must not rewrite the root index")
+	assert.Equal(t, cloud.rootHash, ctx.hashTree.Hash, "the refresh must have caught the tree up to the server root")
 }
 
 func TestUpdateDocumentTagsRefusesAFolder(t *testing.T) {
@@ -872,10 +922,94 @@ func TestUpdateDocumentTagsRefusesToWriteWhenTheLocalCacheIsMissingDocuments(t *
 	assert.Empty(t, cloud.putBlobs)
 }
 
+func TestUpdateDocumentTagsRefusesToWriteWhenALocalCacheEntryHasTheWrongHash(t *testing.T) {
+	// Round 4, item A: assertRootContainment is now exhaustive -- every
+	// local doc must match its server entry by hash, not just the target
+	// doc. Corrupt a sibling's cached hash without moving the server root at
+	// all, so the closure's own live-root refresh has nothing to refresh
+	// (and so cannot silently paper over the corruption by re-mirroring it).
+	cloud, ctx := newFakeCloudCtx(t)
+	docA := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	docB := cloud.seedDoc(t, "doc-2", preservationContent, preservationMetadata)
+	cloud.setRoot(t, docA, docB)
+	ctx.mirrorFrom(t)
+
+	for _, d := range ctx.hashTree.Docs {
+		if d.DocumentID == "doc-2" {
+			d.Hash = "corrupted0000000000000000000000000000000000000000000000000000"
+		}
+	}
+	rootBefore := cloud.rootHash
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match the server")
+	assert.Contains(t, err.Error(), "delete tree.cache")
+	assert.Equal(t, 0, cloud.rootPuts)
+	assert.Empty(t, cloud.putBlobs)
+	assert.Equal(t, rootBefore, cloud.rootHash)
+}
+
+func TestUpdateDocumentTagsRefusesToWriteWhenTheLocalCacheHasAnExtraDocument(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	extra := cloud.seedDoc(t, "doc-2", preservationContent, preservationMetadata) // never added to the server root
+	ctx.hashTree.Docs = append(ctx.hashTree.Docs, extra)
+	rootBefore := cloud.rootHash
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "delete tree.cache")
+	assert.Equal(t, 0, cloud.rootPuts)
+	assert.Empty(t, cloud.putBlobs)
+	assert.Equal(t, rootBefore, cloud.rootHash)
+}
+
+// --- Live-root refresh at closure start (round 4, item A) -------------------
+
+func TestUpdateDocumentTagsRefreshesAStaleLocalRootBeforeWriting(t *testing.T) {
+	// A sibling document changes and syncs while this ctx never refreshes.
+	// The old code would build a plan against the stale tree, upload three
+	// blobs, get refused with a 412, mirror, and retry. The closure now
+	// refreshes up front, so the write lands on the first attempt.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	other := cloud.seedDoc(t, "doc-2", `{}`, `{"type":"CollectionType","visibleName":"F","parent":"","lastModified":"1"}`)
+	cloud.setRoot(t, doc, other)
+	ctx.mirrorFrom(t)
+
+	otherV2 := cloud.seedDoc(t, "doc-2", `{}`, `{"type":"CollectionType","visibleName":"F2","parent":"","lastModified":"2"}`)
+	cloud.setRoot(t, doc, otherV2)
+	rootPutsBefore := cloud.rootPuts
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	require.True(t, res.Changed)
+	assert.Equal(t, rootPutsBefore+1, cloud.rootPuts, "the stale local root must be refreshed up front, not discovered via a wasted PUT + 412")
+
+	rootReader, err := ctx.blobStorage.GetReader(cloud.rootHash, addExt("root", archive.DocSchemaExt))
+	require.NoError(t, err)
+	defer rootReader.Close()
+	entries, _, err := parseIndex(rootReader)
+	require.NoError(t, err)
+	var doc2Entry *Entry
+	for _, e := range entries {
+		if e.DocumentID == "doc-2" {
+			doc2Entry = e
+		}
+	}
+	require.NotNil(t, doc2Entry, "the published root must still list doc-2")
+	assert.Equal(t, otherV2.Hash, doc2Entry.Hash, "the published root must list doc-2 at its new hash, not the stale cached one")
+}
+
 func TestUpdateDocumentTagsSeesAConcurrentChangeInsideTheRetry(t *testing.T) {
-	// The precondition is evaluated inside Sync's closure on purpose: when the
-	// first root write is refused with 412, Sync mirrors the remote tree and
-	// runs the closure again, and only then is the concurrent change visible.
+	// Round 4, item A: the live-root refresh at the top of the closure makes
+	// a concurrent change to docId itself visible on the very first attempt,
+	// before any upload is even attempted -- there is no second attempt to
+	// speak of, and no root PUT is wasted discovering the staleness.
 	cloud, ctx := newFakeCloudCtx(t)
 	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
 	cloud.setRoot(t, doc)
@@ -890,10 +1024,10 @@ func TestUpdateDocumentTagsSeesAConcurrentChangeInsideTheRetry(t *testing.T) {
 
 	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"mine"}, seen)
 	var stale *StaleRevisionError
-	require.True(t, errors.As(err, &stale), "want StaleRevisionError after the retry, got %v", err)
+	require.True(t, errors.As(err, &stale), "want StaleRevisionError, got %v", err)
 	assert.Equal(t, seen, stale.Expected)
 	assert.Equal(t, theirs.Hash, stale.Actual)
-	assert.Equal(t, 1, cloud.rootPuts, "the first root write was refused; no second attempt after the precondition failed")
+	assert.Equal(t, 0, cloud.rootPuts, "the refresh catches the staleness before any root write is attempted")
 	// The other writer's tree is still the cloud's root.
 	root, _, err := ctx.blobStorage.GetRootIndex()
 	require.NoError(t, err)
@@ -904,8 +1038,9 @@ func TestUpdateDocumentTagsSeesAConcurrentChangeInsideTheRetry(t *testing.T) {
 }
 
 func TestUpdateDocumentTagsWithoutPreconditionReappliesOnTheFreshTree(t *testing.T) {
-	// A blind write (no expected revision) retries against the mirrored
-	// document, so the other writer's tag survives and ours is added to it.
+	// A blind write (no expected revision) refreshes against the mirrored
+	// document up front, so the other writer's tag survives and ours is
+	// added to it, landing on the first attempt.
 	cloud, ctx := newFakeCloudCtx(t)
 	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
 	cloud.setRoot(t, doc)
@@ -919,7 +1054,7 @@ func TestUpdateDocumentTagsWithoutPreconditionReappliesOnTheFreshTree(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, []string{"theirs"}, res.BeforeTags)
 	assert.Equal(t, []string{"theirs", "mine"}, res.AfterTags)
-	assert.Equal(t, 2, cloud.rootPuts, "refused once, then written")
+	assert.Equal(t, 1, cloud.rootPuts, "the refresh at the top of the closure picks up the other writer's change before the first attempt, so nothing is refused")
 	assert.Equal(t, []string{"theirs", "mine"}, tagNames(contentTags(t, cloud.blobs[res.ContentHash])))
 }
 
@@ -993,17 +1128,99 @@ func TestUpdateDocumentTagsReadbackReportsSupersededWhenALaterWriterAdvances(t *
 	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "superseded")
-	// The type name and kind string stay "superseded", but the server gives
-	// no way to distinguish "this write landed, then got replaced" from
-	// "this write never landed" — the error text must say so plainly rather
-	// than assert the write landed.
-	assert.Contains(t, err.Error(), "ambiguous")
+	// Round 4, item C: UpdateDocumentTags now establishes, as a local fact
+	// (ctx.hashTree.Hash == attemptedRoot), that this write's own root PUT
+	// committed before readback ever runs -- so a later generation with
+	// docId's entry disagreeing can only mean a later writer replaced it.
+	// The error text says so plainly, not "ambiguous".
+	assert.NotContains(t, err.Error(), "ambiguous")
 	require.NotNil(t, res, "a superseded write must still return the populated result")
 	assert.NotEmpty(t, res.AfterRevision)
 
 	var superseded *SupersededError
 	require.True(t, errors.As(err, &superseded), "want *SupersededError, got %T", err)
 	assert.Equal(t, "doc-1", superseded.DocumentID)
+}
+
+// --- Sync error handling classified from a local fact (round 4, item C/D) ---
+
+func TestUpdateDocumentTagsSucceedsWhenTheRootPutLandsButItsAckIsLost(t *testing.T) {
+	// Round 4, item D: a network failure between the root PUT landing
+	// server-side and its response reaching this process must not be
+	// treated as a lost write -- the readback after a Sync error checks
+	// whether the write actually landed before rolling anything back.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	cloud.rootPutAckLost = true
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	require.True(t, res.Changed)
+	assert.Equal(t, []string{"ops", "reviewed"}, res.AfterTags)
+
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, res.AfterRevision, d.Hash, "the tree must reflect the write that actually landed, not a rollback")
+}
+
+func TestUpdateDocumentTagsReadbackRetriesThroughReplicaLagThenSucceeds(t *testing.T) {
+	// Round 4, item C: a root/entry mismatch at a generation that has not
+	// advanced past the one this write just committed is a contradiction
+	// (this write's own commit is a local fact already established), not
+	// evidence the write never landed -- most likely a read replica that
+	// has not caught up yet. Retried a few times before giving up.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	origDelays := readbackRetryDelays
+	readbackRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { readbackRetryDelays = origDelays })
+
+	cloud.afterRootPut = func() {
+		cloud.mu.Lock()
+		cloud.staleRootHash, cloud.staleGen = rootBefore, genBefore
+		cloud.staleReadsRemaining = 2
+		cloud.mu.Unlock()
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	assert.True(t, res.Changed)
+}
+
+func TestUpdateDocumentTagsReadbackAtOwnCommittedGenerationIsLagNotSupersession(t *testing.T) {
+	// The bar for "a later writer" is the generation this write's commit
+	// PRODUCED, not the base it was planned against. A replica that reports
+	// exactly our committed generation but still serves the pre-write root
+	// is lagging, not superseded -- comparing against the base generation
+	// would have misreported it as SupersededError on the first readback.
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	origDelays := readbackRetryDelays
+	readbackRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { readbackRetryDelays = origDelays })
+
+	cloud.afterRootPut = func() {
+		cloud.mu.Lock()
+		// Pre-write root hash, but the generation our PUT just produced.
+		cloud.staleRootHash, cloud.staleGen = rootBefore, genBefore+1
+		cloud.staleReadsRemaining = 2
+		cloud.mu.Unlock()
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err, "a readback at our own committed generation must be retried as lag, not reported as superseded")
+	assert.True(t, res.Changed)
+	assert.Equal(t, genBefore+1, ctx.hashTree.Generation, "Sync must have recorded the generation the commit produced")
 }
 
 func TestUpdateDocumentTagsLeavesTheTreeUntouchedWhenAnUploadFails(t *testing.T) {
@@ -1097,6 +1314,12 @@ func TestUpdateDocumentTagsRollsBackOnAPostClosureSyncFailure(t *testing.T) {
 }
 
 func TestUpdateDocumentTagsFailsWhenTheServerNeverAcceptsTheRoot(t *testing.T) {
+	// Round 4, item C: the 10-conflict fail-open is classified from a local
+	// fact, not a fresh readback -- Sync's own last retry already mirrored
+	// the tree to the server's true (unchanged) root before giving up, so
+	// no rollback is needed or performed, and this is never Superseded (that
+	// would require another writer to have advanced the generation, which
+	// alwaysConflict never lets happen).
 	cloud, ctx := newFakeCloudCtx(t)
 	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
 	cloud.setRoot(t, doc)
@@ -1107,18 +1330,36 @@ func TestUpdateDocumentTagsFailsWhenTheServerNeverAcceptsTheRoot(t *testing.T) {
 	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not committed")
+
+	var notCommitted *NotCommittedError
+	require.True(t, errors.As(err, &notCommitted), "want *NotCommittedError, got %T", err)
+	var superseded *SupersededError
+	assert.False(t, errors.As(err, &superseded))
+
 	assert.Equal(t, rootBefore, cloud.rootHash, "cloud root must be untouched")
+	assert.Equal(t, cloud.rootHash, ctx.hashTree.Hash, "the tree must reflect the server's true root, left there by Sync's own last mirror")
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	assert.Equal(t, doc.Hash, d.Hash, "doc-1 in the tree must equal the server's own unchanged revision -- no rollback needed")
+	assert.Equal(t, doc.Hash, notCommitted.ActualRevision)
 }
 
 func TestUpdateDocumentTagsReadbackChecksTheServerNotTheCache(t *testing.T) {
 	// A concurrent writer lands its own root write in the instant between our
-	// root PUT succeeding and the readback that follows. The readback must
-	// see their root, not the hash our own Sync call believed it wrote.
+	// root PUT succeeding and the readback that follows, and the fake never
+	// catches back up -- a permanently stale read path. Round 4, item C:
+	// since this write's own commit already succeeded (a local fact), this
+	// is read as replica lag, not "not committed" -- and it is retried
+	// before giving up with a plain error.
 	cloud, ctx := newFakeCloudCtx(t)
 	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
 	cloud.setRoot(t, doc)
 	ctx.mirrorFrom(t)
 	rootBefore, genBefore := cloud.rootHash, cloud.gen
+
+	origDelays := readbackRetryDelays
+	readbackRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { readbackRetryDelays = origDelays })
 
 	cloud.afterRootPut = func() {
 		cloud.mu.Lock()
@@ -1129,7 +1370,8 @@ func TestUpdateDocumentTagsReadbackChecksTheServerNotTheCache(t *testing.T) {
 
 	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not committed")
+	assert.Contains(t, err.Error(), "replica lag")
+	assert.NotContains(t, err.Error(), "not committed")
 }
 
 func TestUpdateDocumentTagsRefreshesTheCachedDocument(t *testing.T) {
@@ -1166,6 +1408,106 @@ func TestUpdateDocumentTagsRefreshesTheCachedDocument(t *testing.T) {
 	rd, err := reloaded.FindDoc("doc-1")
 	require.NoError(t, err)
 	assert.Equal(t, res.AfterTags, rd.ToDocument().Tags)
+}
+
+// --- Plan resolves .content/.metadata from the remote index, not a stale
+// --- cached hash (round 4, item B) ------------------------------------------
+
+func TestUpdateDocumentTagsPlansFromTheServersCurrentContentNotAStaleCachedHash(t *testing.T) {
+	oldContent := strings.Replace(preservationContent, `"tags": [{"name": "ops", "timestamp": 1}]`, `"tags": [{"name": "before", "timestamp": 1}]`, 1)
+	newContent := strings.Replace(preservationContent, `"tags": [{"name": "ops", "timestamp": 1}]`, `"tags": [{"name": "after", "timestamp": 1}]`, 1)
+	require.NotEqual(t, oldContent, newContent)
+
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", newContent, preservationMetadata) // the server's real content is "after"
+	sumOld := sha256.Sum256([]byte(oldContent))
+	oldHash := hex.EncodeToString(sumOld[:])
+	cloud.blobs[oldHash] = []byte(oldContent) // still resolvable, so a stale hash pointing here doesn't 404
+
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	// Corrupt the LOCAL cache's content entry to the old (stale) hash, while
+	// leaving the document's own docSchema hash (d.Hash) untouched -- the
+	// exact staleness fetching via d.Files, instead of the remote index,
+	// used to be vulnerable to.
+	d, err := ctx.hashTree.FindDoc("doc-1")
+	require.NoError(t, err)
+	for _, f := range d.Files {
+		if f.DocumentID == "doc-1.content" {
+			f.Hash = oldHash
+		}
+	}
+
+	res, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"after", "reviewed"}, res.AfterTags, "the plan must be built from the server's current content, not a stale cached hash")
+}
+
+func TestUpdateDocumentTagsRefusesWhenTheRemoteDocIndexDoesNotHashToItsOwnAddress(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	// Tamper with the bytes stored under doc.Hash so they still parse as a
+	// doc index, but no longer hash back to the address they are stored
+	// under -- a corrupted or substituted doc index.
+	tampered := &BlobDoc{Files: []*Entry{
+		{DocumentID: doc.Files[0].DocumentID, Hash: "deadbeef", Type: FileType, Size: 1},
+	}}
+	idx, err := tampered.IndexReader()
+	require.NoError(t, err)
+	body, err := io.ReadAll(idx)
+	require.NoError(t, err)
+	cloud.blobs[doc.Hash] = body
+
+	rootBefore := cloud.rootHash
+	_, err = ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote index for doc-1 hashes to")
+	assert.Equal(t, 0, cloud.rootPuts)
+	assert.Empty(t, cloud.putBlobs)
+	assert.Equal(t, rootBefore, cloud.rootHash)
+}
+
+// --- now is hoisted out of Sync's retry loop (round 4, item E) --------------
+
+func TestUpdateDocumentTagsReusesTheSameBlobHashesAcrossRetries(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	cloud.alwaysConflict = true
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+
+	distinct := make(map[string]bool)
+	for i, name := range cloud.putNames {
+		if name == "root.docSchema" {
+			continue
+		}
+		distinct[cloud.putBlobs[i]] = true
+	}
+	assert.Equal(t, 3, len(distinct), "hoisting now out of the closure means every retry re-PUTs the same content-addressed bytes (content/metadata/docSchema) instead of minting a fresh set each attempt")
+}
+
+// --- RMAPI_FORCE_SCHEMA_VERSION is refused on the write path (round 4, item H)
+
+func TestUpdateDocumentTagsRefusesToWriteWithForcedSchemaVersion(t *testing.T) {
+	cloud, ctx := newFakeCloudCtx(t)
+	doc := cloud.seedDoc(t, "doc-1", preservationContent, preservationMetadata)
+	cloud.setRoot(t, doc)
+	ctx.mirrorFrom(t)
+
+	t.Setenv("RMAPI_FORCE_SCHEMA_VERSION", "3")
+
+	_, err := ctx.UpdateDocumentTags("doc-1", TagOpAdd, []string{"reviewed"}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RMAPI_FORCE_SCHEMA_VERSION")
+	assert.Equal(t, 0, cloud.rootPuts)
+	assert.Empty(t, cloud.putBlobs)
 }
 
 // --- Mirror must track remote Size, not just Hash (upstream BlobDoc.Mirror) -

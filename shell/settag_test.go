@@ -2,6 +2,7 @@ package shell
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"syscall"
@@ -223,6 +224,56 @@ func TestParseSettagArgs(t *testing.T) {
 			args:    []string{"--bogus", "test-note", "inbox"},
 			wantErr: "unknown flag: --bogus",
 		},
+		{
+			name: "--show alone",
+			args: []string{"--show", "test-note"},
+			want: &settagArgs{Show: true, Path: "test-note"},
+		},
+		{
+			name:    "--show combined with --add is an error",
+			args:    []string{"--show", "--add", "test-note"},
+			wantErr: "--show cannot be combined with --add, --remove, or --if-revision",
+		},
+		{
+			name:    "--show combined with --remove is an error",
+			args:    []string{"--show", "--remove", "test-note"},
+			wantErr: "--show cannot be combined with --add, --remove, or --if-revision",
+		},
+		{
+			name:    "--show combined with --if-revision is an error",
+			args:    []string{"--show", "--if-revision=abc", "test-note"},
+			wantErr: "--show cannot be combined with --add, --remove, or --if-revision",
+		},
+		{
+			name:    "--show with a tags positional is an error",
+			args:    []string{"--show", "test-note", "inbox"},
+			wantErr: settagShowUsage,
+		},
+		{
+			name:    "--show with no path is an error",
+			args:    []string{"--show"},
+			wantErr: settagShowUsage,
+		},
+		{
+			name:    "an empty tag list on replace is refused",
+			args:    []string{"test-note", ""},
+			wantErr: "refusing to clear every tag: an empty tag list would wipe the document's tags; use --remove <tag,...> to drop specific tags",
+		},
+		{
+			name:    "an empty tag list on add is the usage error",
+			args:    []string{"--add", "test-note", ""},
+			wantErr: settagUsage,
+		},
+		{
+			name:    "an empty tag list on remove is the usage error",
+			args:    []string{"--remove", "test-note", ""},
+			wantErr: settagUsage,
+		},
+		{
+			name:    "a tag list that parses to nothing is refused the same as truly empty",
+			args:    []string{"test-note", ",,,"},
+			wantErr: "refusing to clear every tag: an empty tag list would wipe the document's tags; use --remove <tag,...> to drop specific tags",
+		},
 	}
 
 	for _, tt := range tests {
@@ -250,6 +301,11 @@ type mockApiCtx struct {
 	expectedRevision string
 	result           *sync15.TagUpdateResult
 	err              error
+
+	revisionCalled bool
+	revisionDocID  string
+	revisionResult string
+	revisionErr    error
 }
 
 func (m *mockApiCtx) Filetree() *filetree.FileTreeCtx           { return m.ft }
@@ -298,6 +354,17 @@ func (m *mockApiCtx) SyncComplete() error {
 }
 func (m *mockApiCtx) Nuke() error                     { return nil }
 func (m *mockApiCtx) Refresh() (string, int64, error) { return "", 0, nil }
+func (m *mockApiCtx) DocumentRevision(docId string) (string, error) {
+	m.revisionCalled = true
+	m.revisionDocID = docId
+	if m.revisionErr != nil {
+		return "", m.revisionErr
+	}
+	if m.revisionResult != "" {
+		return m.revisionResult, nil
+	}
+	return "rev-current", nil
+}
 
 func newSettagTestFixture() (*filetree.FileTreeCtx, *mockApiCtx, *api.UserInfo) {
 	ft := filetree.CreateFileTreeCtx()
@@ -491,4 +558,71 @@ func TestSettagCommandRefusesAFolder(t *testing.T) {
 	assert.Contains(t, err.Error(), "cannot set tags on a folder")
 
 	assert.False(t, mock.called, "the API must not be called for a folder")
+}
+
+// --- --show (round 4, item I) ------------------------------------------------
+
+func TestSettagCommandShowTextOutput(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.revisionResult = "rev-abc123"
+
+	out := captureStdout(t, func() {
+		err := RunShell(mock, userInfo, []string{"settag", "--show", "test-note"}, false)
+		require.NoError(t, err)
+	})
+
+	require.True(t, mock.revisionCalled)
+	assert.Equal(t, "doc-uuid-123", mock.revisionDocID)
+	assert.False(t, mock.called, "--show must not call UpdateDocumentTags")
+	assert.Contains(t, out, "revision: rev-abc123")
+	assert.Contains(t, out, "tags: []")
+}
+
+func TestSettagCommandShowJSONOutput(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.revisionResult = "rev-abc123"
+
+	out := captureStdout(t, func() {
+		err := RunShell(mock, userInfo, []string{"settag", "--show", "test-note"}, true)
+		require.NoError(t, err)
+	})
+
+	require.True(t, mock.revisionCalled)
+	assert.False(t, mock.called)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(out), &got), "stdout must be one JSON object: %s", out)
+	assert.Equal(t, "doc-uuid-123", got["documentId"])
+	assert.Equal(t, "rev-abc123", got["revision"])
+	assert.Equal(t, []interface{}{}, got["tags"], "an empty tag list must serialize as [], not null")
+}
+
+func TestSettagCommandShowPrintsExistingTags(t *testing.T) {
+	ft, mock, userInfo := newSettagTestFixture()
+	node, err := ft.NodeByPath("test-note", ft.Root())
+	require.NoError(t, err)
+	node.Document.Tags = []string{"inbox", "urgent"}
+
+	out := captureStdout(t, func() {
+		err := RunShell(mock, userInfo, []string{"settag", "--show", "test-note"}, false)
+		require.NoError(t, err)
+	})
+	assert.Contains(t, out, "tags: [inbox, urgent]")
+}
+
+func TestSettagCommandShowFailsWhenRevisionLookupFails(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+	mock.revisionErr = errors.New("boom")
+
+	err := RunShell(mock, userInfo, []string{"settag", "--show", "test-note"}, false)
+	require.Error(t, err)
+}
+
+func TestSettagCommandShowRefusesAFolder(t *testing.T) {
+	_, mock, userInfo := newSettagTestFixture()
+
+	err := RunShell(mock, userInfo, []string{"settag", "--show", "a-folder"}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot set tags on a folder")
+	assert.False(t, mock.revisionCalled)
 }
